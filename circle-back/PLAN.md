@@ -19,11 +19,12 @@ $SRC/test/offline-tests.sh
 
 ## Definition of done
 
-- `bash test/offline-tests.sh` reports 0 failures
+- `bash test/offline-tests.sh` reports 0 failures (35 assertions)
 - `/hooks` lists `circle-back.sh` under Stop
 - A single queued prompt fires after its delay, unprompted
 - Two queued prompts fire in order across consecutive turns
 - A queued prompt does not interrupt a long-running turn
+- A 30-minute delay leaves the session immediately responsive
 - Rollback verified as working
 
 ---
@@ -71,7 +72,7 @@ cd "$SRC" && bash test/offline-tests.sh
 ```
 
 **Pass condition:** final line reads `N passed, 0 failed`, exit status 0.
-Expect 32 assertions across 13 groups.
+Expect 35 assertions across 13 groups.
 
 Any failure → stop and report the failing group verbatim. Do not install over a
 red harness.
@@ -213,7 +214,27 @@ need sharpening — report it.
 
 Then end the turn and confirm the entry fires ~10s later.
 
-### 4.5 — final state
+### 4.5 — long delay does not freeze the session
+
+The assertion the first round of testing missed entirely. Every earlier live
+test used a 3–20s delay, where a blocking hook is indistinguishable from normal
+latency.
+
+```bash
+printf '%s\t%s\n' "$(( $(date +%s) + 1800 ))" "This should not have fired." >> "$Q"
+```
+
+End the turn and watch the terminal.
+
+**Pass condition:** the turn ends immediately and the prompt comes back. No
+"running stop hooks" spinner, no delay. Type something — the session must
+respond at once with the entry still pending. Then clear it: `: > "$Q"`.
+
+**If the turn hangs:** a `sleep` is back in the hook. Recover with
+`pkill -f circle-back.sh` after emptying the queue — order matters, since the
+hook pops only after its wait and would otherwise re-block on the next Stop.
+
+### 4.6 — final state
 
 ```bash
 cat /tmp/circle-back-test.log
@@ -227,7 +248,7 @@ order; queue drained to empty.
 
 ## Phase 5 — report
 
-Summarize: which of 4.1–4.5 passed, the observed delay accuracy (queued vs.
+Summarize: which of 4.1–4.6 passed, the observed delay accuracy (queued vs.
 actual seconds), and anything surprising. Then clean up:
 
 ```bash
@@ -259,17 +280,26 @@ Emergency stop without uninstalling: set `"disableAllHooks": true` in
 
 Carry these into the report; none is a bug to fix in this pass.
 
-- Delays clamp to `CIRCLE_BACK_MAX_WAIT` (default 1800s) because the hook
-  holds a `sleep` open and the registered timeout is 1810s. For longer waits,
-  use a one-shot cron task instead — those survive an idle session.
-- Session-scoped by nature: the hook only fires when a turn ends, so nothing
-  fires while the session is closed or sitting idle at the prompt.
+- **The hook must never sleep.** Stop hooks run synchronously and Claude Code
+  blocks the session until they return. The original design slept for the delay
+  inside the hook, which made `/circle-back 1800` a 30-minute freeze — the
+  session sat at "running stop hooks" and accepted no input. Entries now carry
+  an absolute due time and the hook exits in milliseconds when nothing is due.
+  Test group 5 is the regression guard; group 0 fails the build if a bare
+  `sleep` reappears in the script.
+- Firing is turn-driven, not timer-driven. A due entry is noticed at the first
+  turn that *ends* at or after its due time, so nothing fires while the session
+  sits idle at the prompt or is closed. For a prompt that must fire unattended,
+  use a one-shot cron task via the `schedule` skill.
 - The queue is keyed by working directory. Two sessions in the same directory
-  share one queue and will drain each other's entries. Set
-  `CIRCLE_BACK_QUEUE` per session to split them — worth doing if cmux
-  workspaces point at the same repo.
+  share one queue and will drain each other's entries. Set `CIRCLE_BACK_QUEUE`
+  per session to split them — worth doing if cmux workspaces point at the same
+  repo.
 - Append-and-pop has a small race window. Queuing an entry at the exact moment
   the hook rewrites the file can drop it. Rare, and not worth locking around
   until it actually bites.
 - Prompts are one line each; newlines get collapsed. Queued prompts must be
   self-contained, since they arrive with the originating turn out of view.
+- Write queued test prompts so they carry their own follow-through. A prompt
+  ending "reply with only X and do nothing else" leaves the session parked
+  waiting on you — a test-design trap, not a product defect.

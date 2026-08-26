@@ -24,6 +24,10 @@ assert_eq() { # label expected actual
   if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected [$2] got [$3]"; fi
 }
 
+NOW() { date +%s; }
+PAST=1            # an epoch far in the past -> always due
+future() { echo $(( $(NOW) + ${1:-3600} )); }
+
 DEFAULT_EVENT='{"cwd":"/tmp","stop_hook_active":false}'
 fire() { # queue_path [stdin_json] -> prints hook stdout
   CIRCLE_BACK_QUEUE="$1" bash "$HOOK" <<< "${2:-$DEFAULT_EVENT}"
@@ -37,6 +41,8 @@ command -v jq >/dev/null 2>&1 && ok "jq present" || { bad "jq present" "install 
 [ -f "$HOOK" ] && ok "hook script found" || { bad "hook script found" "$HOOK"; exit 1; }
 bash -n "$HOOK" && ok "hook parses" || bad "hook parses"
 bash -n "$SRC/install.sh" && ok "installer parses" || bad "installer parses"
+grep -qE '^[^#]*\bsleep\b' "$HOOK" && bad "hook contains no sleep" "a blocking sleep freezes the session" \
+  || ok "hook contains no sleep"
 
 # ------------------------------------------------------------------- hook
 head_ "1. empty queue ends the turn normally"
@@ -45,9 +51,9 @@ OUT=$(fire "$Q"); RC=$?
 assert_eq "exit 0"      "0"  "$RC"
 assert_eq "no stdout"   ""   "$OUT"
 
-head_ "2. queue drains oldest-first, one per turn"
+head_ "2. due entries drain oldest-first, one per turn"
 Q="$WORK/drain.queue"
-printf '0\tprompt one\n0\tprompt two\n0\tprompt three\n' > "$Q"
+printf '%s\tprompt one\n%s\tprompt two\n%s\tprompt three\n' "$PAST" "$PAST" "$PAST" > "$Q"
 assert_eq "fire 1" "prompt one"   "$(fire "$Q" | reason_of)"
 assert_eq "fire 2" "prompt two"   "$(fire "$Q" | reason_of)"
 assert_eq "fire 3" "prompt three" "$(fire "$Q" | reason_of)"
@@ -56,29 +62,36 @@ assert_eq "4th fire silent"  ""  "$(fire "$Q")"
 
 head_ "3. consecutive fires ignore stop_hook_active"
 Q="$WORK/active.queue"
-printf '0\tafter block\n' > "$Q"
+printf '%s\tafter block\n' "$PAST" > "$Q"
 assert_eq "fires with stop_hook_active=true" "after block" \
   "$(fire "$Q" '{"cwd":"/tmp","stop_hook_active":true}' | reason_of)"
 
-head_ "4. delay is honored"
-Q="$WORK/delay.queue"; printf '2\twaited\n' > "$Q"
-T0=$(date +%s); fire "$Q" >/dev/null; ELAPSED=$(( $(date +%s) - T0 ))
-[ "$ELAPSED" -ge 2 ] && ok "slept >=2s (got ${ELAPSED}s)" || bad "slept >=2s" "got ${ELAPSED}s"
+head_ "4. an entry that is not yet due does not fire"
+Q="$WORK/pending.queue"; printf '%s\tnot yet\n' "$(future 3600)" > "$Q"
+assert_eq "no stdout"     ""  "$(fire "$Q")"
+assert_eq "entry retained" "1" "$(grep -c . "$Q")"
 
-head_ "5. delay clamps to CIRCLE_BACK_MAX_WAIT"
-Q="$WORK/clamp.queue"; printf '99999\ttoo long\n' > "$Q"
-T0=$(date +%s)
-CIRCLE_BACK_MAX_WAIT=2 CIRCLE_BACK_QUEUE="$Q" bash "$HOOK" <<< '{"cwd":"/tmp"}' >/dev/null
-ELAPSED=$(( $(date +%s) - T0 ))
-[ "$ELAPSED" -lt 10 ] && ok "clamped (${ELAPSED}s, not 99999s)" || bad "clamped" "took ${ELAPSED}s"
+head_ "5. REGRESSION: a long delay must not block the session"
+# The original design slept for the delay inside the hook. Stop hooks run
+# synchronously, so `/circle-back 1800` froze the session for 30 minutes.
+Q="$WORK/long.queue"; printf '%s\thalf an hour out\n' "$(future 1800)" > "$Q"
+T0=$(NOW); fire "$Q" >/dev/null; ELAPSED=$(( $(NOW) - T0 ))
+[ "$ELAPSED" -le 2 ] && ok "returned in ${ELAPSED}s, not 1800s" \
+  || bad "returned promptly" "took ${ELAPSED}s -- the hook is blocking again"
 
-head_ "6. malformed delay degrades to 0"
-Q="$WORK/junk.queue"; printf 'abc\tbad delay\n' > "$Q"
-assert_eq "still fires" "bad delay" "$(fire "$Q" | reason_of)"
+head_ "6. a pending entry does not hold up a later due one"
+Q="$WORK/jump.queue"
+printf '%s\tstill waiting\n%s\tready now\n' "$(future 3600)" "$PAST" > "$Q"
+assert_eq "due entry fires past the pending one" "ready now" "$(fire "$Q" | reason_of)"
+assert_eq "pending entry retained" "still waiting" "$(cut -f2 "$Q")"
 
-head_ "7. shell-hostile prompts survive intact"
+head_ "7. malformed due time fires immediately"
+Q="$WORK/junk.queue"; printf 'abc\tbad due time\n' > "$Q"
+assert_eq "still fires" "bad due time" "$(fire "$Q" | reason_of)"
+
+head_ "8. shell-hostile prompts survive intact"
 Q="$WORK/evil.queue"
-printf '0\tfix the "auth" bug in C:\\path; echo $HOME `whoami` && rm -rf /\n' > "$Q"
+printf '%s\tfix the "auth" bug in C:\\path; echo $HOME `whoami` && rm -rf /\n' "$PAST" > "$Q"
 OUT=$(fire "$Q")
 case "$OUT" in
   *'$HOME'*whoami*) ok "metacharacters preserved, not expanded" ;;
@@ -86,18 +99,12 @@ case "$OUT" in
 esac
 [ ! -e "$WORK/pwned" ] && ok "nothing executed" || bad "nothing executed"
 
-head_ "8. kill mid-sleep leaves the entry queued"
-Q="$WORK/survive.queue"; printf '30\tshould survive\n' > "$Q"
-CIRCLE_BACK_QUEUE="$Q" bash "$HOOK" <<< '{"cwd":"/tmp"}' >/dev/null 2>&1 &
-HPID=$!; sleep 1; kill -9 $HPID 2>/dev/null; wait $HPID 2>/dev/null
-assert_eq "entry retained" "1" "$(grep -c . "$Q")"
-
 head_ "9. queues are scoped per working directory"
 export CIRCLE_BACK_DIR="$WORK/scoped"; mkdir -p "$CIRCLE_BACK_DIR"
 unset CIRCLE_BACK_QUEUE
 hash_of() { printf '%s' "$1" | { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-12; }
-printf '0\tfrom repo A\n' > "$CIRCLE_BACK_DIR/$(hash_of /repo/a).queue"
-printf '0\tfrom repo B\n' > "$CIRCLE_BACK_DIR/$(hash_of /repo/b).queue"
+printf '%s\tfrom repo A\n' "$PAST" > "$CIRCLE_BACK_DIR/$(hash_of /repo/a).queue"
+printf '%s\tfrom repo B\n' "$PAST" > "$CIRCLE_BACK_DIR/$(hash_of /repo/b).queue"
 assert_eq "repo A isolated" "from repo A" \
   "$(bash "$HOOK" <<< '{"cwd":"/repo/a"}' | reason_of)"
 assert_eq "repo B isolated" "from repo B" \
@@ -124,7 +131,7 @@ assert_eq "PostToolUse preserved" "~/.claude/hooks/pre-existing.sh" "$(jq -r '.h
 assert_eq "existing Stop hook preserved" "~/.claude/hooks/pre-existing-stop.sh" "$(jq -r '.hooks.Stop[0].hooks[0].command' "$S")"
 assert_eq "circle-back registered" "1" \
   "$(jq '[.hooks.Stop[].hooks[] | select(.command|test("circle-back"))] | length' "$S")"
-assert_eq "timeout exceeds max wait" "1810" \
+assert_eq "short timeout, hook never sleeps" "10" \
   "$(jq -r '.hooks.Stop[].hooks[] | select(.command|test("circle-back")) | .timeout' "$S")"
 [ -f "$HOME/.claude/skills/circle-back/SKILL.md" ] && ok "skill installed" || bad "skill installed"
 [ -x "$HOME/.claude/hooks/circle-back.sh" ] && ok "hook installed executable" || bad "hook installed executable"

@@ -26,7 +26,7 @@ jq '
     hooks: [{
       type: "command",
       command: "~/.claude/hooks/circle-back.sh",
-      timeout: 1810
+      timeout: 10
     }]
   }]
   end
