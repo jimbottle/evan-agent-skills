@@ -14,23 +14,25 @@ cp "$SRC/hooks/circle-back.sh" "$DEST/hooks/circle-back.sh"
 chmod +x "$DEST/hooks/circle-back.sh"
 
 [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
-cp "$SETTINGS" "$SETTINGS.bak.$(date +%s)"
 
-# Append the Stop hook without disturbing existing hooks.
-jq '
-  .hooks //= {} |
-  .hooks.Stop //= [] |
-  if [.hooks.Stop[]?.hooks[]?.command] | any(. == "~/.claude/hooks/circle-back.sh")
-  then .
-  else .hooks.Stop += [{
-    hooks: [{
-      type: "command",
-      command: "~/.claude/hooks/circle-back.sh",
-      timeout: 10
+if jq -e '[.hooks.Stop[]?.hooks[]?.command] | any(. == "~/.claude/hooks/circle-back.sh")' "$SETTINGS" >/dev/null; then
+  echo "Stop hook already registered; settings.json left untouched (no backup written)."
+else
+  # Back up only when we are about to change settings, so the newest backup is
+  # always the pre-install state and rollback can restore it safely.
+  cp "$SETTINGS" "$SETTINGS.bak.$(date +%s)"
+  jq '
+    .hooks //= {} |
+    .hooks.Stop //= [] |
+    .hooks.Stop += [{
+      hooks: [{
+        type: "command",
+        command: "~/.claude/hooks/circle-back.sh",
+        timeout: 10
+      }]
     }]
-  }]
-  end
-' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+  ' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+fi
 
-echo "installed. restart Claude Code, then try:"
+echo "installed. hooks hot-reload in running sessions (check with /hooks); then try:"
 echo "  /circle-back 60 summarize what we just changed"

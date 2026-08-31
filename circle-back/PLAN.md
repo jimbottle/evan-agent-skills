@@ -19,10 +19,11 @@ $SRC/test/offline-tests.sh
 
 ## Definition of done
 
-- `bash test/offline-tests.sh` reports 0 failures (35 assertions)
+- `bash test/offline-tests.sh` reports 0 failures (45 assertions)
 - `/hooks` lists `circle-back.sh` under Stop
 - A single queued prompt fires after its delay, unprompted
 - Two queued prompts fire in order across consecutive turns
+- A due entry queued *after* a later-due one still fires first (due order, not file order)
 - A queued prompt does not interrupt a long-running turn
 - A 30-minute delay leaves the session immediately responsive
 - Rollback verified as working
@@ -52,9 +53,10 @@ jq -c '.hooks.Stop // "none"' ~/.claude/settings.json 2>/dev/null || echo "no se
 ls ~/.claude/hooks/ 2>/dev/null
 ```
 
-Note whether a Stop hook already exists. If one does, flag it — two Stop hooks
-run concurrently, and if the existing one is slow it competes with this one's
-`sleep`. Not a blocker, but say so before continuing.
+Note whether a Stop hook already exists. If one does, flag it. Multiple Stop
+hooks run concurrently and every blocking reason is delivered together, so a
+pre-existing hook does not prevent circle-back from firing — but a slow one
+still delays the turn ending. Not a blocker, but say so before continuing.
 
 **0.4** Confirm no session is mid-task in this working directory other than
 this one.
@@ -72,7 +74,7 @@ cd "$SRC" && bash test/offline-tests.sh
 ```
 
 **Pass condition:** final line reads `N passed, 0 failed`, exit status 0.
-Expect 35 assertions across 13 groups.
+Expect 45 assertions across 15 groups.
 
 Any failure → stop and report the failing group verbatim. Do not install over a
 red harness.
@@ -88,9 +90,11 @@ cd "$SRC" && bash install.sh
 ```
 
 It copies `SKILL.md` to `~/.claude/skills/circle-back/`, copies the hook to
-`~/.claude/hooks/`, `chmod +x`'s it, backs up `settings.json` to
-`settings.json.bak.<epoch>`, and appends the Stop hook entry via jq. It's
-idempotent — a second run won't duplicate the registration.
+`~/.claude/hooks/`, `chmod +x`'s it, and — only if the Stop hook is not yet
+registered — backs up `settings.json` to `settings.json.bak.<epoch>` and
+appends the entry via jq. A re-run refreshes the copied files but leaves
+`settings.json` and the backups alone, so the newest backup is always the
+pre-install state.
 
 **2.2** Verify the install landed:
 
@@ -101,8 +105,9 @@ test -f ~/.claude/skills/circle-back/SKILL.md && echo "skill present"
 ls -t ~/.claude/settings.json.bak.* | head -1
 ```
 
-**Pass condition:** `true`, both echoes, and a backup path. Also confirm any
-pre-existing hooks noted in 0.3 are still present.
+**Pass condition:** `true`, both echoes, and a backup path (from the first
+install; a re-run writes no new backup). Also confirm any pre-existing hooks
+noted in 0.3 are still present.
 
 **2.3** Smoke-test the installed copy directly, bypassing Claude entirely:
 
@@ -177,6 +182,15 @@ printf '5\tRun: echo "FIRE2B $(date +%%s)" >> /tmp/circle-back-test.log -- then 
 
 **Pass condition:** both fire, A before B, ~5s apart, each in its own turn.
 
+Then check due-order (the bug found in the 2026-08-30 live run): queue C with
+a *later* due time first and D with an *earlier* one second, end the turn, and
+confirm D fires before C:
+
+```bash
+printf '%s\tRun: echo "FIRE2C $(date +%%s)" >> /tmp/circle-back-test.log -- then reply with only FIRE2C-DONE.\n' "$(( $(date +%s) + 5 ))" >> "$Q"
+printf '%s\tRun: echo "FIRE2D $(date +%%s)" >> /tmp/circle-back-test.log -- then reply with only FIRE2D-DONE.\n' "$(( $(date +%s) - 5 ))" >> "$Q"
+```
+
 **If only A fires:** the harness is refusing a second consecutive block. Report
 this rather than working around it — it's a real constraint on the design, and
 the fix is a different mechanism (a one-shot cron carrying the next prompt),
@@ -241,8 +255,8 @@ cat /tmp/circle-back-test.log
 grep -c . "$Q"   # expect 0
 ```
 
-**Pass condition:** FIRE1, FIRE2A, FIRE2B, FIRE3, SKILLTEST all present in
-order; queue drained to empty.
+**Pass condition:** FIRE1, FIRE2A, FIRE2B, FIRE2D, FIRE2C, FIRE3, SKILLTEST
+all present in that order; queue drained to empty.
 
 ---
 
@@ -261,12 +275,18 @@ Leave the install in place unless a test failed.
 
 ## Rollback
 
-If anything is wrong, restore from the installer's backup:
+If anything is wrong, remove the registration surgically — this leaves every
+other hook and setting exactly as it is:
 
 ```bash
-cp "$(ls -t ~/.claude/settings.json.bak.* | head -1)" ~/.claude/settings.json
+S=~/.claude/settings.json
+jq '.hooks.Stop |= map(select(([.hooks[]?.command] | any(test("circle-back"))) | not))' "$S" > "$S.tmp" && mv "$S.tmp" "$S"
 rm -rf ~/.claude/skills/circle-back ~/.claude/hooks/circle-back.sh ~/.claude/circle-back
 ```
+
+Restoring `settings.json.bak.<epoch>` wholesale also works, but only if
+nothing else has edited `settings.json` since the install (Claude Code writes
+to it too, e.g. permission grants) — prefer the jq form.
 
 Then `/hooks` to confirm the Stop entry is gone. **HUMAN GATE** — a restart may
 be needed for deregistration to take effect.
@@ -289,8 +309,9 @@ Carry these into the report; none is a bug to fix in this pass.
   `sleep` reappears in the script.
 - Firing is turn-driven, not timer-driven. A due entry is noticed at the first
   turn that *ends* at or after its due time, so nothing fires while the session
-  sits idle at the prompt or is closed. For a prompt that must fire unattended,
-  use a one-shot cron task via the `schedule` skill.
+  sits idle at the prompt or is closed. For a prompt that must fire while the
+  session is idle, use the built-in `CronCreate` tool (`recurring: false`);
+  for one that must fire with no session open, use the `schedule` skill.
 - The queue is keyed by working directory. Two sessions in the same directory
   share one queue and will drain each other's entries. Set `CIRCLE_BACK_QUEUE`
   per session to split them — worth doing if cmux workspaces point at the same
@@ -300,6 +321,13 @@ Carry these into the report; none is a bug to fix in this pass.
   until it actually bites.
 - Prompts are one line each; newlines get collapsed. Queued prompts must be
   self-contained, since they arrive with the originating turn out of view.
+- `CronCreate` one-shots (the built-in scheduler behind `/loop`) fire only
+  while the REPL is idle. In the 2026-08-30 live run a one-shot scheduled for
+  19:57 was still pending at 19:59 because a `/goal` Stop hook kept the session
+  continuously busy, while queue entries fired at every Stop. The two
+  mechanisms are complementary: the queue fires at turn boundaries and never
+  while idle; cron fires while idle and never mid-work. Pick by whether the
+  user will still be ending turns when the prompt is due.
 - Write queued test prompts so they carry their own follow-through. A prompt
   ending "reply with only X and do nothing else" leaves the session parked
   waiting on you — a test-design trap, not a product defect.

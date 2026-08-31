@@ -1,5 +1,6 @@
 ---
 name: circle-back
+argument-hint: <seconds> <prompt>
 description: Queue a follow-up prompt to be sent automatically once a delay has elapsed, without interrupting work in progress. Use this whenever the user says "circle around", "circle back", "queue this for later", "come back to this in X minutes", "after this is done, also...", or otherwise wants a prompt held and fired later rather than acted on now — including when the queued prompt is unrelated to whatever is currently in flight.
 ---
 
@@ -11,8 +12,9 @@ next instruction, otherwise it exits instantly and the turn ends normally.
 
 ## Adding an entry
 
-Invocation looks like `/circle-back <seconds> <prompt>`. The first token is the
-delay in seconds; everything after it is the prompt, verbatim.
+Invocation looks like `/circle-back <seconds> <prompt>`. Claude Code hands the
+arguments to you as a trailing `ARGUMENTS: <seconds> <prompt>` line. The first
+token is the delay in seconds; everything after it is the prompt, verbatim.
 
 Convert the delay to an absolute due timestamp, then append:
 
@@ -33,9 +35,18 @@ not while the session sits idle at the prompt — the hook only runs on Stop, so
 something has to end a turn for a due entry to be noticed.
 
 In practice "circle back in 30 minutes" means "next time I finish a turn, 30+
-minutes from now." Say this plainly if the user seems to expect an alarm. If
-they need a prompt to fire while they're away from the session, that's a job for
-a one-shot cron task via the `schedule` skill, not for this one.
+minutes from now." Say this plainly if the user seems to expect an alarm.
+
+If the prompt must fire on its own while the session sits idle — the user is
+stepping away, or wants it as a reminder rather than a follow-up to ongoing
+work — use the built-in `CronCreate` tool with `recurring: false` instead of
+the queue. It enqueues the prompt at the next idle moment on or after the
+scheduled minute, does not need this hook, and survives `--resume`. Its
+trade-offs: minute granularity, session-only, no ordering guarantee against
+queue entries, and it will not fire at all while the session is continuously
+busy (for example under a `/goal` or `/loop` that keeps blocking Stop). For
+prompts that must fire with no session open at all, use the `schedule` skill
+(cloud routines).
 
 ## Rules
 
@@ -44,8 +55,9 @@ a one-shot cron task via the `schedule` skill, not for this one.
   referent. Expand pronouns into nouns before writing the entry.
 - One line per entry. Collapse any newlines in the prompt to spaces.
 - The delay is measured from when you queue it.
-- Entries fire oldest-due first, one per turn. An entry that isn't due yet does
-  not hold up a later one that is.
+- Entries fire by due time, earliest first, one per turn — regardless of the
+  order they were queued in. An entry that isn't due yet does not hold up a
+  later one that is.
 - If the user gives a delay in minutes or hours, convert to seconds yourself
   rather than asking.
 - If the user gives no delay, use 0 — it fires at the end of the current turn.
@@ -77,9 +89,11 @@ sed "${N}d" "$Q" > "$Q.tmp" && mv "$Q.tmp" "$Q"
 ## How it fires
 
 The `Stop` hook at `~/.claude/hooks/circle-back.sh` runs when a turn ends. It
-scans for the first entry whose due time has passed, removes it, and returns
+picks the due entry with the earliest due time, removes it, and returns
 `{"decision":"block","reason":"<prompt>"}`, which Claude Code delivers as the
-next instruction. Nothing due — or an empty queue — means it exits silently.
+next instruction (it shows up as "Stop hook feedback"). Nothing due — or an
+empty queue — means it exits silently. Other Stop hooks that also block are
+delivered alongside it, not instead of it.
 
 The hook never sleeps. Stop hooks run synchronously and Claude Code blocks on
 them, so a hook that slept for the delay would freeze the whole session for that

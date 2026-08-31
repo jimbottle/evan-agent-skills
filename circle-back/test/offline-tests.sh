@@ -33,7 +33,7 @@ fire() { # queue_path [stdin_json] -> prints hook stdout
   CIRCLE_BACK_QUEUE="$1" bash "$HOOK" <<< "${2:-$DEFAULT_EVENT}"
 }
 
-reason_of() { grep -o '"reason"[^,]*' | sed 's/.*: *"//; s/"$//'; }
+reason_of() { jq -r '.reason // empty' 2>/dev/null; }
 
 # ---------------------------------------------------------------- preflight
 head_ "0. preflight"
@@ -84,6 +84,18 @@ Q="$WORK/jump.queue"
 printf '%s\tstill waiting\n%s\tready now\n' "$(future 3600)" "$PAST" > "$Q"
 assert_eq "due entry fires past the pending one" "ready now" "$(fire "$Q" | reason_of)"
 assert_eq "pending entry retained" "still waiting" "$(cut -f2 "$Q")"
+
+head_ "6b. REGRESSION: due entries fire by due time, not file order"
+# Live test 2026-08-30: entry queued first with a later due time fired ahead of
+# an entry queued second that was due earlier, because the scan took the first
+# due line in file order. SKILL.md promises oldest-due-first.
+Q="$WORK/order.queue"
+printf '%s\tqueued first, due later\n%s\tqueued second, due earlier\n' "$(( $(NOW) - 10 ))" "$(( $(NOW) - 100 ))" > "$Q"
+assert_eq "earlier due fires first" "queued second, due earlier" "$(fire "$Q" | reason_of)"
+assert_eq "later due fires next"    "queued first, due later"    "$(fire "$Q" | reason_of)"
+Q="$WORK/tie.queue"
+printf '%s\ttie A\n%s\ttie B\n' "$PAST" "$PAST" > "$Q"
+assert_eq "equal due times keep queue order" "tie A" "$(fire "$Q" | reason_of)"
 
 head_ "7. malformed due time fires immediately"
 Q="$WORK/junk.queue"; printf 'abc\tbad due time\n' > "$Q"
@@ -142,12 +154,30 @@ bash "$SRC/install.sh" >/dev/null 2>&1
 assert_eq "no duplicate registration" "1" \
   "$(jq '[.hooks.Stop[].hooks[] | select(.command|test("circle-back"))] | length' "$S")"
 assert_eq "Stop group count stable" "2" "$(jq '.hooks.Stop | length' "$S")"
+assert_eq "no second backup on a no-op run" "1" "$(ls "$HOME"/.claude/settings.json.bak.* | wc -l | tr -d ' ')"
 
 head_ "12. installer handles a virgin ~/.claude"
 export HOME="$WORK/home2"; mkdir -p "$HOME"
 bash "$SRC/install.sh" >/dev/null 2>&1
 assert_eq "hook registered from scratch" "1" \
   "$(jq '[.hooks.Stop[].hooks[] | select(.command|test("circle-back"))] | length' "$HOME/.claude/settings.json")"
+
+head_ "13. rollback restores the pre-install settings and removes files"
+export HOME="$WORK/home"   # the install from group 10/11 lives here
+S="$HOME/.claude/settings.json"
+jq '.hooks.Stop |= map(select(([.hooks[]?.command] | any(test("circle-back"))) | not))' "$S" > "$S.tmp" && mv "$S.tmp" "$S"
+rm -rf "$HOME/.claude/skills/circle-back" "$HOME/.claude/hooks/circle-back.sh" "$HOME/.claude/circle-back"
+S="$HOME/.claude/settings.json"
+jq -e . "$S" >/dev/null 2>&1 && ok "settings.json valid after rollback" || bad "settings.json valid after rollback"
+assert_eq "circle-back unregistered" "0" \
+  "$(jq '[.hooks.Stop[]?.hooks[]? | select(.command|test("circle-back"))] | length' "$S")"
+assert_eq "pre-existing Stop hook still present" "~/.claude/hooks/pre-existing-stop.sh" "$(jq -r '.hooks.Stop[0].hooks[0].command' "$S")"
+assert_eq "unrelated keys survive rollback" "opus" "$(jq -r '.model' "$S")"
+[ ! -e "$HOME/.claude/hooks/circle-back.sh" ] && [ ! -e "$HOME/.claude/skills/circle-back" ] \
+  && ok "hook and skill files removed" || bad "hook and skill files removed"
+BAK=$(ls -t "$HOME"/.claude/settings.json.bak.* | head -1)
+assert_eq "newest backup is the pre-install state" "0" \
+  "$(jq '[.hooks.Stop[]?.hooks[]? | select(.command|test("circle-back"))] | length' "$BAK")"
 
 # ------------------------------------------------------------------ result
 printf '\n\033[1m%d passed, %d failed\033[0m\n' "$PASS" "$FAIL"

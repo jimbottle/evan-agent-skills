@@ -39,16 +39,21 @@ fi
 
 NOW=$(date +%s)
 
-# Find the first due entry. A not-yet-due entry does not block a later one that
-# is due, so a 30s follow-up queued behind a 2h one still fires on time.
+# Find the due entry with the earliest due time (ties: earliest in file). A
+# not-yet-due entry does not block a later one that is due, so a 30s follow-up
+# queued behind a 2h one still fires on time -- and a due entry queued *after*
+# a later-due one does not jump ahead of it.
 TARGET=0
+BEST=0
 N=0
 while IFS= read -r LINE || [ -n "$LINE" ]; do
   N=$((N+1))
   [ -n "$LINE" ] || continue
   DUE=${LINE%%$'\t'*}
   case "$DUE" in ''|*[!0-9]*) DUE=0 ;; esac   # malformed -> due immediately
-  if [ "$DUE" -le "$NOW" ]; then TARGET=$N; break; fi
+  if [ "$DUE" -le "$NOW" ] && { [ "$TARGET" -eq 0 ] || [ "$DUE" -lt "$BEST" ]; }; then
+    TARGET=$N; BEST=$DUE
+  fi
 done < "$QUEUE"
 
 # Nothing due yet: end the turn normally. This is the common case and is what
