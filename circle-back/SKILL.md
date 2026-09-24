@@ -6,9 +6,19 @@ description: Queue a follow-up prompt to be sent automatically once a delay has 
 
 # circle-back
 
-Hold a prompt in a queue file with an absolute due time. A Stop hook checks the
-queue when a turn ends: if an entry has come due it feeds the prompt back as the
-next instruction, otherwise it exits instantly and the turn ends normally.
+Hold a prompt and send it later. There are two ways to hold it, and the choice
+matters:
+
+- **Timed delay (the default): the built-in `CronCreate` tool.** Claude Code's
+  own scheduler sends the prompt at the due minute, as long as the session is
+  open and at the prompt. If the session is busy then, it goes out as soon as
+  the current work finishes. It shows up in the terminal like any prompt you
+  typed.
+- **"After this is done" (delay 0): the Stop-hook queue.** A queue file that
+  the `circle-back.sh` Stop hook reads when a turn ends. It has no timer, so it
+  only fires when a turn *ends*. A session left at the prompt never ends
+  another turn, so a timed entry here can sit unfired for hours. Don't use it
+  for timed delays, except in the case below.
 
 ## Adding an entry
 
@@ -16,7 +26,30 @@ Invocation looks like `/circle-back <seconds> <prompt>`. Claude Code hands the
 arguments to you as a trailing `ARGUMENTS: <seconds> <prompt>` line. The first
 token is the delay in seconds; everything after it is the prompt, verbatim.
 
-Convert the delay to an absolute due timestamp, then append:
+### Delay greater than 0: schedule it with `CronCreate`
+
+Load `CronCreate` with ToolSearch if it's deferred. Round the due time **up**
+to the next whole minute and build a one-shot cron expression:
+
+```bash
+T=$(( $(date +%s) + SECONDS_ARG + 59 ))
+date -r "$T" '+%M %H %d %m' | awk '{print $1+0, $2+0, $3+0, $4+0, "*"}'
+```
+
+Call `CronCreate` with that expression as `cron`, the prompt as `prompt`, and
+`recurring: false`. Then confirm in one line: the due time (clock time, not
+just the delay) and a few words of the prompt. Keep the returned job ID in that
+line, since `CronDelete` needs it to cancel.
+
+Use the queue instead only when:
+
+- `CronCreate` isn't available in this session, or
+- the session will be kept continuously busy past the due time (a `/goal` or
+  `/loop` whose Stop hook keeps blocking). Cron only fires at idle moments, so
+  it won't fire until that loop stops. The queue fires at every turn end, so it
+  keeps working.
+
+### Delay 0, or "after this is done": append to the queue
 
 ```bash
 Q="${CIRCLE_BACK_QUEUE:-$HOME/.claude/circle-back/$(printf '%s' "$PWD" | shasum -a 256 | cut -c1-12).queue}"
@@ -24,29 +57,25 @@ mkdir -p "$(dirname "$Q")"
 printf '%s\t%s\n' "$(( $(date +%s) + SECONDS_ARG ))" "$PROMPT_ARG" >> "$Q"
 ```
 
-Then confirm in one line — the delay and a few words of the prompt — and stop.
-Do not start on the queued work, do not elaborate on it, do not ask whether the
-user wants it done now instead. Queuing is the whole job.
+It fires when the current turn ends.
 
-## When it actually fires
+Either way, stop after confirming. Do not start on the queued work, do not
+elaborate on it, do not ask whether the user wants it done now instead.
+Scheduling is the whole job.
 
-**At the first turn that ends at or after the due time.** Not on a timer, and
-not while the session sits idle at the prompt — the hook only runs on Stop, so
-something has to end a turn for a due entry to be noticed.
+## Limits to tell the user about
 
-In practice "circle back in 30 minutes" means "next time I finish a turn, 30+
-minutes from now." Say this plainly if the user seems to expect an alarm.
-
-If the prompt must fire on its own while the session sits idle — the user is
-stepping away, or wants it as a reminder rather than a follow-up to ongoing
-work — use the built-in `CronCreate` tool with `recurring: false` instead of
-the queue. It enqueues the prompt at the next idle moment on or after the
-scheduled minute, does not need this hook, and survives `--resume`. Its
-trade-offs: minute granularity, session-only, no ordering guarantee against
-queue entries, and it will not fire at all while the session is continuously
-busy (for example under a `/goal` or `/loop` that keeps blocking Stop). For
-prompts that must fire with no session open at all, use the `schedule` skill
-(cloud routines).
+- **The session has to stay open.** Both mechanisms live in this Claude Code
+  session. `CronCreate` jobs are in memory only and are gone when Claude exits
+  (they do not survive a restart or `--resume`). If the machine sleeps, the job
+  fires when it wakes, as long as the session is still open. For prompts that
+  must run with no session open, use the `schedule` skill (cloud routines).
+- **Cron granularity is one minute.** One-shots due at :00 or :30 can fire up
+  to 90 s early. For an approximate delay, a minute off the :00/:30 marks is
+  fine.
+- **Queue entries fire only when a turn ends.** If you did use the queue for a
+  timed entry, say plainly that it waits for the next turn to end after the
+  due time, not for the clock.
 
 ## Rules
 
@@ -54,19 +83,22 @@ prompts that must fire with no session open at all, use the `schedule` skill
   gone from view, so "fix that" or "now the other one" will land with no
   referent. Expand pronouns into nouns before writing the entry.
 - One line per entry. Collapse any newlines in the prompt to spaces.
-- The delay is measured from when you queue it.
-- Entries fire by due time, earliest first, one per turn — regardless of the
-  order they were queued in. An entry that isn't due yet does not hold up a
+- The delay is measured from when you schedule it.
+- Queue entries fire by due time, earliest first, one per turn, regardless of
+  the order they were queued in. An entry that isn't due yet does not hold up a
   later one that is.
 - If the user gives a delay in minutes or hours, convert to seconds yourself
   rather than asking.
-- If the user gives no delay, use 0 — it fires at the end of the current turn.
-- Beyond a few hours, prefer the `schedule` skill. A queue entry only fires if
-  the session is still open and still ending turns.
+- If the user gives no delay, use 0. It goes in the queue and fires at the end
+  of the current turn.
+- Beyond a few hours, prefer the `schedule` skill. Both mechanisms need the
+  session to still be open.
 
-## Inspecting the queue
+## Inspecting what's pending
 
-List what's pending, with due times rendered:
+Scheduled cron jobs: `CronList`; cancel one with `CronDelete <id>`.
+
+Queue entries, with due times rendered, with due times rendered:
 
 ```bash
 while IFS=$'\t' read -r due prompt; do
@@ -86,7 +118,7 @@ Drop a single entry by line number:
 sed "${N}d" "$Q" > "$Q.tmp" && mv "$Q.tmp" "$Q"
 ```
 
-## How it fires
+## How the queue fires
 
 The `Stop` hook at `~/.claude/hooks/circle-back.sh` runs when a turn ends. It
 picks the due entry with the earliest due time, removes it, and returns

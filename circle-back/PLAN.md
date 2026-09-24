@@ -309,9 +309,13 @@ Carry these into the report; none is a bug to fix in this pass.
   `sleep` reappears in the script.
 - Firing is turn-driven, not timer-driven. A due entry is noticed at the first
   turn that *ends* at or after its due time, so nothing fires while the session
-  sits idle at the prompt or is closed. For a prompt that must fire while the
-  session is idle, use the built-in `CronCreate` tool (`recurring: false`);
-  for one that must fire with no session open, use the `schedule` skill.
+  sits idle at the prompt or is closed. Because of this, the skill now uses the
+  built-in `CronCreate` tool (`recurring: false`) for any delay above 0, and
+  keeps the queue for delay 0 ("after this is done") and for sessions a
+  `/goal` or `/loop` keeps continuously busy. On 2026-09-23 a queued
+  `/circle-back 1080 /roborev-fix` sat unfired overnight because that session
+  never ended another turn. For a prompt that must fire with no session open,
+  use the `schedule` skill.
 - The queue is keyed by working directory. Two sessions in the same directory
   share one queue and will drain each other's entries. Set `CIRCLE_BACK_QUEUE`
   per session to split them — worth doing if cmux workspaces point at the same
