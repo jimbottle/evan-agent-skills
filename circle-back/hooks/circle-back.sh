@@ -36,21 +36,29 @@ SID=$(jq -r '.session_id // empty' <<<"$INPUT")
 [ -n "$SID" ] || SID="${CLAUDE_CODE_SESSION_ID:-}"
 ATTENDED="${CLAUDE_CODE_SESSION_ATTENDED:-0}"
 
-# Session tag of an entry (field 2 when it looks like a session id), else "".
+# An attended session adopts another session's entry once it is this overdue.
+# The owner may be gone (/clear, closed terminal, crash); without adoption its
+# entries would never fire and never leave the file.
+ADOPT_AFTER="${CIRCLE_BACK_ADOPT_AFTER:-3600}"
+case "$ADOPT_AFTER" in ''|*[!0-9]*) ADOPT_AFTER=3600 ;; esac
+
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+# Session tag of an entry (field 2 when it is a UUID session id), else "".
 entry_sid() {
   local rest=${1#*$'\t'}
   [ "$rest" != "$1" ] || return 0
   local f2=${rest%%$'\t'*}
-  if [ "$f2" != "$rest" ] && [[ "$f2" =~ ^[0-9a-fA-F-]{8,}$ ]]; then printf '%s' "$f2"; fi
+  if [ "$f2" != "$rest" ] && [[ "$f2" =~ $UUID_RE ]]; then printf '%s' "$f2"; fi
 }
 
-# May THIS session fire the entry?
+# May THIS session fire the entry?  eligible <line> <due>
 eligible() {
   local tag
   tag=$(entry_sid "$1")
-  if [ -n "$tag" ]; then [ -n "$SID" ] && [ "$tag" = "$SID" ]
-  else [ "$ATTENDED" = "1" ]
-  fi
+  if [ -z "$tag" ]; then [ "$ATTENDED" = "1" ]; return; fi
+  [ -n "$SID" ] && [ "$tag" = "$SID" ] && return 0
+  [ "$ATTENDED" = "1" ] && [ $(( NOW - $2 )) -ge "$ADOPT_AFTER" ]
 }
 
 # Queue is scoped per working directory so parallel sessions in different
@@ -78,9 +86,9 @@ N=0
 while IFS= read -r LINE || [ -n "$LINE" ]; do
   N=$((N+1))
   [ -n "$LINE" ] || continue
-  eligible "$LINE" || continue               # another session's entry: leave it
   DUE=${LINE%%$'\t'*}
   case "$DUE" in ''|*[!0-9]*) DUE=0 ;; esac   # malformed -> due immediately
+  eligible "$LINE" "$DUE" || continue        # another session's entry: leave it
   if [ "$DUE" -le "$NOW" ] && { [ "$TARGET" -eq 0 ] || [ "$DUE" -lt "$BEST" ]; }; then
     TARGET=$N; BEST=$DUE
   fi

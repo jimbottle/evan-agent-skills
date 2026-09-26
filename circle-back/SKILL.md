@@ -144,3 +144,8 @@ reviewer running `claude -p`, a subagent, a second terminal) leaves them alone.
 Before this, a reviewer drained a queued `/roborev-fix` and answered it in its
 review output (2026-09-24). Legacy untagged entries fire only in an attended
 session. `CIRCLE_BACK_QUEUE` still overrides the file location.
+
+`/clear` starts a new session id, and a closed or crashed terminal never stops
+again, so an entry can outlive its session. Once a tagged entry is an hour
+overdue (`CIRCLE_BACK_ADOPT_AFTER` seconds), the next attended session that
+stops in the directory takes it over and fires it. Headless sessions never do.

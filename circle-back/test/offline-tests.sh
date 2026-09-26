@@ -133,7 +133,8 @@ Q="$WORK/sessions.queue"
 MINE=11111111-aaaa-bbbb-cccc-000000000001
 THEIRS=22222222-aaaa-bbbb-cccc-000000000002
 as() { jq -nc --arg s "$1" '{cwd:"/tmp",session_id:$s}'; }
-printf '%s\t%s\tfor theirs\n%s\t%s\tfor mine\n' "$PAST" "$THEIRS" "$PAST" "$MINE" > "$Q"
+JUST_DUE=$(( $(NOW) - 60 ))   # due, but well inside the adoption window
+printf '%s\t%s\tfor theirs\n%s\t%s\tfor mine\n' "$JUST_DUE" "$THEIRS" "$JUST_DUE" "$MINE" > "$Q"
 assert_eq "own tagged entry fires, tag stripped" "for mine" \
   "$(fire "$Q" "$(as "$MINE")" | reason_of)"
 assert_eq "other session's entry not fired here" "" \
@@ -143,6 +144,18 @@ printf '%s\tlegacy entry\n' "$PAST" > "$Q"
 assert_eq "headless reviewer leaves legacy entry" "" \
   "$(CLAUDE_CODE_SESSION_ATTENDED=0 fire "$Q" "$(as "$THEIRS")" | reason_of)"
 assert_eq "attended session fires legacy entry" "legacy entry" \
+  "$(fire "$Q" "$(as "$MINE")" | reason_of)"
+printf '%s\t%s\trecent foreign\n' "$(( $(NOW) - 60 ))" "$THEIRS" > "$Q"
+assert_eq "recently due foreign entry left for its owner" "" \
+  "$(fire "$Q" "$(as "$MINE")" | reason_of)"
+printf '%s\t%s\torphaned\n' "$(( $(NOW) - 7200 ))" "$THEIRS" > "$Q"
+assert_eq "headless session does not adopt an orphan" "" \
+  "$(CLAUDE_CODE_SESSION_ATTENDED=0 fire "$Q" "$(as "$MINE")" | reason_of)"
+assert_eq "attended session adopts an hour-overdue orphan" "orphaned" \
+  "$(fire "$Q" "$(as "$MINE")" | reason_of)"
+assert_eq "adopted orphan removed" "0" "$(grep -c . "$Q" 2>/dev/null | head -1)"
+printf '%s\tdeadbeef\tcheck it\n' "$PAST" > "$Q"
+assert_eq "hex word in a legacy prompt is not a session tag" "deadbeef	check it" \
   "$(fire "$Q" "$(as "$MINE")" | reason_of)"
 
 # -------------------------------------------------------------- installer
