@@ -138,7 +138,8 @@ else
   DUE_N=0
   while IFS= read -r LINE || [ -n "$LINE" ]; do
     D=${LINE%%$'\t'*}; case "$D" in ''|*[!0-9]*) D=0 ;; esac
-    [ -n "$LINE" ] && [ "$D" -le "$NOW" ] && DUE_N=$((DUE_N+1))
+    # Count only entries this session would fire; others aren't its to report.
+    [ -n "$LINE" ] && [ "$D" -le "$NOW" ] && eligible "$LINE" "$D" && DUE_N=$((DUE_N+1))
   done < "$QUEUE"
   [ "$DUE_N" -gt 0 ] && jq -n --arg n "$DUE_N" --arg q "$QUEUE" \
     '{systemMessage:("circle-back: " + $n + " due entr(y/ies) not fired -- needs flock or perl to lock " + $q)}'

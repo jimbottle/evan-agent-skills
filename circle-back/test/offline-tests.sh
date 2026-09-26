@@ -230,6 +230,14 @@ esac
 assert_eq "unlocked: queue untouched" "2" "$(grep -c . "$Q")"
 printf '%s\tnot yet\n' "$(future)" > "$Q"
 assert_eq "unlocked: silent when nothing is due" "" "$(nolock_fire "$Q" "$(as "$MINE")")"
+register "$THEIRS" $$
+printf '%s\t%s\ttheirs, live\n%s\tlegacy\n' "$PAST" "$THEIRS" "$PAST" > "$Q"
+assert_eq "unlocked: headless session silent about others' entries" "" \
+  "$(CLAUDE_CODE_SESSION_ATTENDED=0 nolock_fire "$Q" "$(as "$MINE")")"
+case "$(nolock_fire "$Q" "$(as "$MINE")" | jq -r '.systemMessage // empty')" in
+  *"1 due"*) ok "unlocked: attended count excludes a live session's entry" ;;
+  *) bad "unlocked: attended count excludes a live session's entry" ;;
+esac
 rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
 
 # -------------------------------------------------------------- installer
