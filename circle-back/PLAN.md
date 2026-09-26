@@ -324,14 +324,18 @@ Carry these into the report; none is a bug to fix in this pass.
 - The hook's select-and-remove holds `flock(2)` on `<queue>.lock` (flock(1)
   where installed, else perl's flock, since stock macOS lacks flock(1)). The
   lock dies with the process, so a killed hook leaves nothing stale. It never
-  waits: if the lock is held it skips that Stop. Appends (`printf >>` in
+  waits: if the lock is held it skips that Stop. With neither flock(1) nor
+  perl installed it runs unlocked and fires only the calling session's own
+  entries (no legacy or adopted ones), which no other session competes for.
+  Appends (`printf >>` in
   SKILL.md) don't take the lock, so queuing an entry at the exact moment the
   hook rewrites the file can still drop it. Rare.
 - Adoption of a dead session's entries relies on `~/.claude/sessions/*.json`,
   an internal Claude Code file, not a documented interface. It is parsed with
   jq, a pid counts only if it is alive and its start time matches `procStart`
   (compared in UTC), and the registry is trusted only if it lists the calling
-  session. If it is missing or untrusted, the hook falls back to adopting
+  session and every file in it parses (a file caught mid-rewrite could be a
+  live session's). If it is missing or untrusted, the hook falls back to adopting
   entries an hour overdue.
 - Prompts are one line each; newlines get collapsed. Queued prompts must be
   self-contained, since they arrive with the originating turn out of view.

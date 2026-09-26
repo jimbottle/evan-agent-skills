@@ -62,17 +62,20 @@ entry_sid() {
 # registry says -- a crashed session's pid can be reused. Parsed with jq, not
 # grepped, so formatting changes can't hide a live session. Loaded lazily:
 # only a foreign tagged entry needs it.
-LIVE_SIDS=""; REG_LOADED=0; REG_OK=0
+LIVE_SIDS=""; REG_LOADED=0; REG_OK=0; REG_BAD=0
 load_registry() {
   [ "$REG_LOADED" = 1 ] && return; REG_LOADED=1
   [ -d "$SESSIONS_DIR" ] || return
   local f row pid sid pstart actual
   for f in "$SESSIONS_DIR"/*.json; do
     [ -f "$f" ] || continue
-    row=$(jq -r '[(.pid // "" | tostring), (.sessionId // ""), (.procStart // "")] | @tsv' "$f" 2>/dev/null) || continue
+    # A file that won't parse (maybe caught mid-rewrite) could be a live
+    # session's; don't read its absence as "gone" -- distrust the registry.
+    row=$(jq -r '[(.pid // "" | tostring), (.sessionId // ""), (.procStart // "")] | @tsv' "$f" 2>/dev/null) \
+      || { REG_BAD=1; continue; }
     IFS=$'\t' read -r pid sid pstart <<<"$row"
-    case "$pid" in ''|*[!0-9]*) continue ;; esac
-    [ -n "$sid" ] || continue
+    case "$pid" in ''|*[!0-9]*) REG_BAD=1; continue ;; esac
+    [ -n "$sid" ] || { REG_BAD=1; continue; }
     kill -0 "$pid" 2>/dev/null || continue
     if [ -n "$pstart" ]; then
       actual=$(TZ=UTC ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
@@ -82,7 +85,7 @@ load_registry() {
   done
   # The registry is trusted only if it knows this session; otherwise its
   # format may have changed and "not listed" can't be read as "gone".
-  [ -n "$SID" ] && grep -qxF "$SID" <<<"$LIVE_SIDS" && REG_OK=1
+  [ "$REG_BAD" = 0 ] && [ -n "$SID" ] && grep -qxF "$SID" <<<"$LIVE_SIDS" && REG_OK=1
 }
 
 # Is the session with this id still running?  0 = live, 1 = gone, 2 = unknown.
@@ -97,8 +100,11 @@ owner_live() {
 eligible() {
   local tag rc
   tag=$(entry_sid "$1")
+  [ -n "$tag" ] && [ -n "$SID" ] && [ "$tag" = "$SID" ] && return 0
+  # Without a lock, fire only our own entries -- nothing else stops there --
+  # so an entry another session could also pick can't fire twice.
+  [ "$LOCKED" = 1 ] || return 1
   if [ -z "$tag" ]; then [ "$ATTENDED" = "1" ]; return; fi
-  [ -n "$SID" ] && [ "$tag" = "$SID" ] && return 0
   [ "$ATTENDED" = "1" ] || return 1
   owner_live "$tag"; rc=$?
   [ "$rc" -eq 1 ] && return 0
@@ -124,11 +130,15 @@ fi
 # Stop hook must not block): if it's held, skip -- a due entry fires next Stop.
 # Stock macOS has no flock(1); perl's flock locks the same open file, which
 # stays locked while this shell keeps fd 9 open.
+# With neither available, run unlocked but fire only this session's own
+# entries (see eligible).
 exec 9>>"$QUEUE.lock" || exit 0
+LOCKED=0
 if command -v flock >/dev/null 2>&1; then
-  flock -n 9 || exit 0
+  flock -n 9 || exit 0; LOCKED=1
 elif command -v perl >/dev/null 2>&1; then
   perl -MFcntl=:flock -e 'open(my $f, ">&=", 9) or exit 2; flock($f, LOCK_EX|LOCK_NB) or exit 1' || exit 0
+  LOCKED=1
 fi
 
 # Find the due entry with the earliest due time (ties: earliest in file). A

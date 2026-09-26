@@ -190,6 +190,11 @@ assert_eq "no registry: recently due entry left alone" "" \
 rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json   # registry present, but doesn't list MINE
 assert_eq "registry without this session is not trusted" "" \
   "$(fire "$Q" "$(as "$MINE")" | reason_of)"
+register "$MINE" $$
+printf '{"pid": 1' > "$CIRCLE_BACK_SESSIONS_DIR/torn.json"   # caught mid-rewrite
+assert_eq "registry with an unparsable file is not trusted" "" \
+  "$(fire "$Q" "$(as "$MINE")" | reason_of)"
+rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
 
 head_ "9d. select-and-remove is locked, never waited on"
 printf '%s\tlocked out\n' "$PAST" > "$Q"
@@ -207,6 +212,20 @@ assert_eq "released lock: entry fires" "locked out" "$(fire "$Q" | reason_of)"
 printf '%s\tafter a killed holder\n' "$PAST" > "$Q"
 bash -c 'exec 9>>"$1"; perl -MFcntl=:flock -e "open(my \$f, q(>&=), 9); flock(\$f, LOCK_EX)"; kill -9 $$' _ "$Q.lock" 2>/dev/null
 assert_eq "killed holder leaves no stale lock" "after a killed holder" "$(fire "$Q" | reason_of)"
+
+head_ "9e. without flock or perl, only the session's own entries fire"
+NOLOCK_BIN="$WORK/nolock-bin"; mkdir -p "$NOLOCK_BIN"
+for t in bash jq shasum sha256sum date sed mktemp mv grep cut ps tr cat; do
+  P=$(command -v "$t") && ln -sf "$P" "$NOLOCK_BIN/$t"
+done
+nolock_fire() { CIRCLE_BACK_QUEUE="$1" PATH="$NOLOCK_BIN" "$NOLOCK_BIN/bash" "$HOOK" <<< "$2"; }
+register "$MINE" $$
+printf '%s\tlegacy unlocked\n%s\t%s\tforeign unlocked\n%s\t%s\town unlocked\n' \
+  "$PAST" "$PAST" "$THEIRS" "$PAST" "$MINE" > "$Q"
+assert_eq "unlocked: own entry fires" "own unlocked" "$(nolock_fire "$Q" "$(as "$MINE")" | reason_of)"
+assert_eq "unlocked: legacy and orphaned entries left" "" "$(nolock_fire "$Q" "$(as "$MINE")" | reason_of)"
+assert_eq "unlocked: both still queued" "2" "$(grep -c unlocked "$Q")"
+rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
 
 # -------------------------------------------------------------- installer
 head_ "10. installer merges without clobbering existing config"
