@@ -20,6 +20,7 @@ trap 'rm -rf "$WORK"' EXIT
 # 1-9 exercise legacy untagged entries, which fire only in an attended session.
 unset CLAUDE_CODE_SESSION_ID
 export CLAUDE_CODE_SESSION_ATTENDED=1
+export CIRCLE_BACK_SESSIONS_DIR="$WORK/sessions"; mkdir -p "$CIRCLE_BACK_SESSIONS_DIR"
 
 ok()   { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n'   "$1"; [ $# -gt 1 ] && printf '       %s\n' "$2"; }
@@ -133,30 +134,53 @@ Q="$WORK/sessions.queue"
 MINE=11111111-aaaa-bbbb-cccc-000000000001
 THEIRS=22222222-aaaa-bbbb-cccc-000000000002
 as() { jq -nc --arg s "$1" '{cwd:"/tmp",session_id:$s}'; }
-JUST_DUE=$(( $(NOW) - 60 ))   # due, but well inside the adoption window
-printf '%s\t%s\tfor theirs\n%s\t%s\tfor mine\n' "$JUST_DUE" "$THEIRS" "$JUST_DUE" "$MINE" > "$Q"
+# THEIRS is a live session: registered under this test shell's pid.
+register() { jq -nc --argjson p "$2" --arg s "$1" '{pid:$p,sessionId:$s}' > "$CIRCLE_BACK_SESSIONS_DIR/$2.json"; }
+register "$THEIRS" $$
+printf '%s\t%s\tfor theirs\n%s\t%s\tfor mine\n' "$PAST" "$THEIRS" "$PAST" "$MINE" > "$Q"
 assert_eq "own tagged entry fires, tag stripped" "for mine" \
   "$(fire "$Q" "$(as "$MINE")" | reason_of)"
-assert_eq "other session's entry not fired here" "" \
+assert_eq "live session's overdue entry not adopted" "" \
   "$(fire "$Q" "$(as "$MINE")" | reason_of)"
-assert_eq "other session's entry retained" "1" "$(grep -c 'for theirs' "$Q")"
+assert_eq "live session's entry retained" "1" "$(grep -c 'for theirs' "$Q")"
 printf '%s\tlegacy entry\n' "$PAST" > "$Q"
 assert_eq "headless reviewer leaves legacy entry" "" \
   "$(CLAUDE_CODE_SESSION_ATTENDED=0 fire "$Q" "$(as "$THEIRS")" | reason_of)"
 assert_eq "attended session fires legacy entry" "legacy entry" \
   "$(fire "$Q" "$(as "$MINE")" | reason_of)"
-printf '%s\t%s\trecent foreign\n' "$(( $(NOW) - 60 ))" "$THEIRS" > "$Q"
-assert_eq "recently due foreign entry left for its owner" "" \
-  "$(fire "$Q" "$(as "$MINE")" | reason_of)"
-printf '%s\t%s\torphaned\n' "$(( $(NOW) - 7200 ))" "$THEIRS" > "$Q"
-assert_eq "headless session does not adopt an orphan" "" \
-  "$(CLAUDE_CODE_SESSION_ATTENDED=0 fire "$Q" "$(as "$MINE")" | reason_of)"
-assert_eq "attended session adopts an hour-overdue orphan" "orphaned" \
-  "$(fire "$Q" "$(as "$MINE")" | reason_of)"
-assert_eq "adopted orphan removed" "0" "$(grep -c . "$Q" 2>/dev/null | head -1)"
 printf '%s\tdeadbeef\tcheck it\n' "$PAST" > "$Q"
 assert_eq "hex word in a legacy prompt is not a session tag" "deadbeef	check it" \
   "$(fire "$Q" "$(as "$MINE")" | reason_of)"
+
+head_ "9c. orphaned entries are adopted once their session is gone"
+rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
+DEAD=999999; while kill -0 "$DEAD" 2>/dev/null; do DEAD=$((DEAD-1)); done
+register "$THEIRS" "$DEAD"            # registered, but the process is gone
+printf '%s\t%s\torphaned\n' "$(( $(NOW) - 60 ))" "$THEIRS" > "$Q"
+assert_eq "headless session does not adopt an orphan" "" \
+  "$(CLAUDE_CODE_SESSION_ATTENDED=0 fire "$Q" "$(as "$MINE")" | reason_of)"
+assert_eq "attended session adopts a dead session's due entry" "orphaned" \
+  "$(fire "$Q" "$(as "$MINE")" | reason_of)"
+assert_eq "adopted orphan removed" "0" "$(grep -c . "$Q" 2>/dev/null | head -1)"
+printf '%s\t%s\tunregistered\n' "$(( $(NOW) - 60 ))" "$THEIRS" > "$Q"
+rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
+assert_eq "unregistered session counts as gone" "unregistered" \
+  "$(fire "$Q" "$(as "$MINE")" | reason_of)"
+printf '%s\t%s\tno registry, recent\n%s\t%s\tno registry, old\n' \
+  "$(( $(NOW) - 60 ))" "$THEIRS" "$(( $(NOW) - 7200 ))" "$THEIRS" > "$Q"
+assert_eq "no registry: hour-overdue entry adopted" "no registry, old" \
+  "$(CIRCLE_BACK_SESSIONS_DIR="$WORK/nonexistent" fire "$Q" "$(as "$MINE")" | reason_of)"
+assert_eq "no registry: recently due entry left alone" "" \
+  "$(CIRCLE_BACK_SESSIONS_DIR="$WORK/nonexistent" fire "$Q" "$(as "$MINE")" | reason_of)"
+
+head_ "9d. select-and-remove is locked, never waited on"
+printf '%s\tlocked out\n' "$PAST" > "$Q"
+mkdir "$Q.lock"
+assert_eq "held lock: hook skips this Stop" "" "$(fire "$Q" | reason_of)"
+assert_eq "held lock: entry kept" "1" "$(grep -c 'locked out' "$Q")"
+touch -t 200001010000 "$Q.lock"
+assert_eq "stale lock is broken" "locked out" "$(fire "$Q" | reason_of)"
+[ ! -e "$Q.lock" ] && ok "lock released after firing" || bad "lock released after firing"
 
 # -------------------------------------------------------------- installer
 head_ "10. installer merges without clobbering existing config"

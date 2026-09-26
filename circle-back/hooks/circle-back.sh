@@ -36,11 +36,16 @@ SID=$(jq -r '.session_id // empty' <<<"$INPUT")
 [ -n "$SID" ] || SID="${CLAUDE_CODE_SESSION_ID:-}"
 ATTENDED="${CLAUDE_CODE_SESSION_ATTENDED:-0}"
 
-# An attended session adopts another session's entry once it is this overdue.
-# The owner may be gone (/clear, closed terminal, crash); without adoption its
-# entries would never fire and never leave the file.
+# An attended session adopts another session's due entry once that session is
+# gone (/clear starts a new id; a closed or crashed terminal never stops
+# again) -- otherwise its entries would never fire and never leave the file.
+# Liveness comes from Claude Code's live-session registry, one
+# <pid>.json per running session carrying its current sessionId. If the
+# registry is missing, fall back to adopting entries ADOPT_AFTER seconds overdue.
+SESSIONS_DIR="${CIRCLE_BACK_SESSIONS_DIR:-$HOME/.claude/sessions}"
 ADOPT_AFTER="${CIRCLE_BACK_ADOPT_AFTER:-3600}"
 case "$ADOPT_AFTER" in ''|*[!0-9]*) ADOPT_AFTER=3600 ;; esac
+NOW=$(date +%s)
 
 UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 
@@ -52,13 +57,28 @@ entry_sid() {
   if [ "$f2" != "$rest" ] && [[ "$f2" =~ $UUID_RE ]]; then printf '%s' "$f2"; fi
 }
 
+# Is the session with this id still running?  0 = live, 1 = gone, 2 = unknown.
+owner_live() {
+  [ -d "$SESSIONS_DIR" ] || return 2
+  local f pid
+  for f in $(grep -l "\"sessionId\":\"$1\"" "$SESSIONS_DIR"/*.json 2>/dev/null); do
+    pid=$(jq -r '.pid // empty' "$f" 2>/dev/null)
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null && return 0
+  done
+  return 1
+}
+
 # May THIS session fire the entry?  eligible <line> <due>
 eligible() {
-  local tag
+  local tag rc
   tag=$(entry_sid "$1")
   if [ -z "$tag" ]; then [ "$ATTENDED" = "1" ]; return; fi
   [ -n "$SID" ] && [ "$tag" = "$SID" ] && return 0
-  [ "$ATTENDED" = "1" ] && [ $(( NOW - $2 )) -ge "$ADOPT_AFTER" ]
+  [ "$ATTENDED" = "1" ] || return 1
+  owner_live "$tag"; rc=$?
+  [ "$rc" -eq 1 ] && return 0
+  [ "$rc" -eq 2 ] && [ $(( NOW - $2 )) -ge "$ADOPT_AFTER" ]
 }
 
 # Queue is scoped per working directory so parallel sessions in different
@@ -74,7 +94,18 @@ fi
 # Nothing queued: allow the turn to end normally.
 [ -s "$QUEUE" ] || exit 0
 
-NOW=$(date +%s)
+# Serialize select-and-remove: with adoption, two sessions stopping at once
+# could otherwise both fire the same entry. Never wait for the lock (a Stop
+# hook must not block); if it's held, skip -- a due entry fires next Stop.
+# A lock older than 30s is left over from a killed hook and is broken.
+LOCK="$QUEUE.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  MTIME=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK" 2>/dev/null || echo "$NOW")
+  if [ $(( NOW - MTIME )) -gt 30 ] && rmdir "$LOCK" 2>/dev/null && mkdir "$LOCK" 2>/dev/null; then :
+  else exit 0
+  fi
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
 # Find the due entry with the earliest due time (ties: earliest in file). A
 # not-yet-due entry does not block a later one that is due, so a 30s follow-up

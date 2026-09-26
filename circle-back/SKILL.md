@@ -140,12 +140,17 @@ the original design and it made a 30-minute delay a 30-minute lockup.
 The queue file is scoped per working directory, and each entry is scoped to the
 session that queued it: the hook fires only entries tagged with its own
 session id, so another session stopping in the same directory (a roborev
-reviewer running `claude -p`, a subagent, a second terminal) leaves them alone.
-Before this, a reviewer drained a queued `/roborev-fix` and answered it in its
-review output (2026-09-24). Legacy untagged entries fire only in an attended
-session. `CIRCLE_BACK_QUEUE` still overrides the file location.
+reviewer running `claude -p`, a subagent, a second terminal) leaves them alone
+while their owner is still running. Before this, a reviewer drained a queued
+`/roborev-fix` and answered it in its review output (2026-09-24). Legacy
+untagged entries fire only in an attended session. `CIRCLE_BACK_QUEUE` still
+overrides the file location.
 
-`/clear` starts a new session id, and a closed or crashed terminal never stops
-again, so an entry can outlive its session. Once a tagged entry is an hour
-overdue (`CIRCLE_BACK_ADOPT_AFTER` seconds), the next attended session that
-stops in the directory takes it over and fires it. Headless sessions never do.
+The one exception is an entry whose session is gone: `/clear` starts a new
+session id, and a closed or crashed terminal never stops again. The hook checks
+Claude Code's live-session registry (`~/.claude/sessions/<pid>.json`, which
+records each running session's pid and current id). Once a due entry's owner
+is no longer there, the next attended session that stops in the directory
+takes it over and fires it. Headless sessions never do. If the registry is
+missing, it falls back to adopting entries more than an hour overdue
+(`CIRCLE_BACK_ADOPT_AFTER` seconds).
