@@ -12,7 +12,16 @@
 # lockup. Instead each entry carries an absolute due timestamp; when nothing is
 # due the hook exits in milliseconds and the turn ends normally.
 #
-# Queue file format, one entry per line:  <due_epoch_seconds><TAB><prompt>
+# Queue file format, one entry per line:
+#   <due_epoch_seconds><TAB><session_id><TAB><prompt>   (current)
+#   <due_epoch_seconds><TAB><prompt>                    (legacy, untagged)
+#
+# Entries belong to the session that queued them. The queue file is keyed by
+# directory, and OTHER Claude Code sessions run in the same directory -- a
+# roborev reviewer (`claude -p`) finishing its review is a Stop too, and it
+# used to drain the entry and answer the queued prompt in its review output
+# (2026-09-24, louisville-open-data roborev job 4799). A tagged entry now fires
+# only in its own session; a legacy untagged one only in an attended session.
 
 set -uo pipefail
 
@@ -23,6 +32,26 @@ command -v jq >/dev/null 2>&1 || exit 0
 INPUT=$(cat)
 CWD=$(jq -r '.cwd // empty' <<<"$INPUT")
 [ -n "$CWD" ] || CWD="$PWD"
+SID=$(jq -r '.session_id // empty' <<<"$INPUT")
+[ -n "$SID" ] || SID="${CLAUDE_CODE_SESSION_ID:-}"
+ATTENDED="${CLAUDE_CODE_SESSION_ATTENDED:-0}"
+
+# Session tag of an entry (field 2 when it looks like a session id), else "".
+entry_sid() {
+  local rest=${1#*$'\t'}
+  [ "$rest" != "$1" ] || return 0
+  local f2=${rest%%$'\t'*}
+  if [ "$f2" != "$rest" ] && [[ "$f2" =~ ^[0-9a-fA-F-]{8,}$ ]]; then printf '%s' "$f2"; fi
+}
+
+# May THIS session fire the entry?
+eligible() {
+  local tag
+  tag=$(entry_sid "$1")
+  if [ -n "$tag" ]; then [ -n "$SID" ] && [ "$tag" = "$SID" ]
+  else [ "$ATTENDED" = "1" ]
+  fi
+}
 
 # Queue is scoped per working directory so parallel sessions in different
 # repos don't drain each other's prompts. Override with CIRCLE_BACK_QUEUE.
@@ -49,6 +78,7 @@ N=0
 while IFS= read -r LINE || [ -n "$LINE" ]; do
   N=$((N+1))
   [ -n "$LINE" ] || continue
+  eligible "$LINE" || continue               # another session's entry: leave it
   DUE=${LINE%%$'\t'*}
   case "$DUE" in ''|*[!0-9]*) DUE=0 ;; esac   # malformed -> due immediately
   if [ "$DUE" -le "$NOW" ] && { [ "$TARGET" -eq 0 ] || [ "$DUE" -lt "$BEST" ]; }; then
@@ -62,6 +92,7 @@ done < "$QUEUE"
 
 ENTRY=$(sed -n "${TARGET}p" "$QUEUE")
 PROMPT=${ENTRY#*$'\t'}
+[ -z "$(entry_sid "$ENTRY")" ] || PROMPT=${PROMPT#*$'\t'}   # drop the session tag
 
 TMP=$(mktemp) && sed "${TARGET}d" "$QUEUE" > "$TMP" && mv "$TMP" "$QUEUE"
 

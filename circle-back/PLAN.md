@@ -316,10 +316,11 @@ Carry these into the report; none is a bug to fix in this pass.
   `/circle-back 1080 /roborev-fix` sat unfired overnight because that session
   never ended another turn. For a prompt that must fire with no session open,
   use the `schedule` skill.
-- The queue is keyed by working directory. Two sessions in the same directory
-  share one queue and will drain each other's entries. Set `CIRCLE_BACK_QUEUE`
-  per session to split them — worth doing if cmux workspaces point at the same
-  repo.
+- The queue file is keyed by working directory, but each entry carries the
+  session id that queued it and fires only in that session. Before this, a
+  roborev reviewer (`claude -p` in the same repo) drained a queued
+  `/roborev-fix` and answered it in its review output (2026-09-24). Legacy
+  untagged entries fire only in an attended session.
 - Append-and-pop has a small race window. Queuing an entry at the exact moment
   the hook rewrites the file can drop it. Rare, and not worth locking around
   until it actually bites.

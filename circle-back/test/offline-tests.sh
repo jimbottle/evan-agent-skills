@@ -16,6 +16,11 @@ PASS=0; FAIL=0
 
 trap 'rm -rf "$WORK"' EXIT
 
+# Hermetic: don't inherit the running Claude Code session's identity. Groups
+# 1-9 exercise legacy untagged entries, which fire only in an attended session.
+unset CLAUDE_CODE_SESSION_ID
+export CLAUDE_CODE_SESSION_ATTENDED=1
+
 ok()   { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n'   "$1"; [ $# -gt 1 ] && printf '       %s\n' "$2"; }
 head_() { printf '\n\033[1m%s\033[0m\n' "$1"; }
@@ -122,6 +127,23 @@ assert_eq "repo A isolated" "from repo A" \
 assert_eq "repo B isolated" "from repo B" \
   "$(bash "$HOOK" <<< '{"cwd":"/repo/b"}' | reason_of)"
 unset CIRCLE_BACK_DIR
+
+head_ "9b. entries fire only in the session that queued them"
+Q="$WORK/sessions.queue"
+MINE=11111111-aaaa-bbbb-cccc-000000000001
+THEIRS=22222222-aaaa-bbbb-cccc-000000000002
+as() { jq -nc --arg s "$1" '{cwd:"/tmp",session_id:$s}'; }
+printf '%s\t%s\tfor theirs\n%s\t%s\tfor mine\n' "$PAST" "$THEIRS" "$PAST" "$MINE" > "$Q"
+assert_eq "own tagged entry fires, tag stripped" "for mine" \
+  "$(fire "$Q" "$(as "$MINE")" | reason_of)"
+assert_eq "other session's entry not fired here" "" \
+  "$(fire "$Q" "$(as "$MINE")" | reason_of)"
+assert_eq "other session's entry retained" "1" "$(grep -c 'for theirs' "$Q")"
+printf '%s\tlegacy entry\n' "$PAST" > "$Q"
+assert_eq "headless reviewer leaves legacy entry" "" \
+  "$(CLAUDE_CODE_SESSION_ATTENDED=0 fire "$Q" "$(as "$THEIRS")" | reason_of)"
+assert_eq "attended session fires legacy entry" "legacy entry" \
+  "$(fire "$Q" "$(as "$MINE")" | reason_of)"
 
 # -------------------------------------------------------------- installer
 head_ "10. installer merges without clobbering existing config"

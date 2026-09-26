@@ -54,8 +54,12 @@ Use the queue instead only when:
 ```bash
 Q="${CIRCLE_BACK_QUEUE:-$HOME/.claude/circle-back/$(printf '%s' "$PWD" | shasum -a 256 | cut -c1-12).queue}"
 mkdir -p "$(dirname "$Q")"
-printf '%s\t%s\n' "$(( $(date +%s) + SECONDS_ARG ))" "$PROMPT_ARG" >> "$Q"
+printf '%s\t%s\t%s\n' "$(( $(date +%s) + SECONDS_ARG ))" "${CLAUDE_CODE_SESSION_ID:?no session id}" "$PROMPT_ARG" >> "$Q"
 ```
+
+The middle field ties the entry to THIS session: the hook fires it only here,
+never in another Claude Code session that stops in the same directory (a
+roborev reviewer, a subagent, a second terminal).
 
 It fires when the current turn ends.
 
@@ -98,11 +102,12 @@ Scheduling is the whole job.
 
 Scheduled cron jobs: `CronList`; cancel one with `CronDelete <id>`.
 
-Queue entries, with due times rendered, with due times rendered:
+Queue entries, with due times rendered (a legacy two-field entry shows its
+prompt in the session column):
 
 ```bash
-while IFS=$'\t' read -r due prompt; do
-  printf '%s  (in %ss)  %s\n' "$(date -r "$due" '+%H:%M:%S')" "$(( due - $(date +%s) ))" "$prompt"
+while IFS=$'\t' read -r due sid prompt; do
+  printf '%s  (in %ss)  [%s]  %s\n' "$(date -r "$due" '+%H:%M:%S')" "$(( due - $(date +%s) ))" "${sid:0:8}" "$prompt"
 done < "$Q"
 ```
 
@@ -132,6 +137,10 @@ them, so a hook that slept for the delay would freeze the whole session for that
 long. If you are tempted to add a `sleep` to make timing exact, don't: that was
 the original design and it made a 30-minute delay a 30-minute lockup.
 
-The queue is scoped per working directory, so two sessions in different repos
-keep separate queues. Two sessions in the *same* directory share one — set
-`CIRCLE_BACK_QUEUE` per session to split them.
+The queue file is scoped per working directory, and each entry is scoped to the
+session that queued it: the hook fires only entries tagged with its own
+session id, so another session stopping in the same directory (a roborev
+reviewer running `claude -p`, a subagent, a second terminal) leaves them alone.
+Before this, a reviewer drained a queued `/roborev-fix` and answered it in its
+review output (2026-09-24). Legacy untagged entries fire only in an attended
+session. `CIRCLE_BACK_QUEUE` still overrides the file location.
