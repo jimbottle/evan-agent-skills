@@ -325,8 +325,8 @@ Carry these into the report; none is a bug to fix in this pass.
   where installed, else perl's flock, since stock macOS lacks flock(1)). The
   lock dies with the process, so a killed hook leaves nothing stale. It never
   waits: if the lock is held it skips that Stop. With neither flock(1) nor
-  perl installed it runs unlocked and fires only the calling session's own
-  entries (no legacy or adopted ones), which no other session competes for.
+  perl installed it never touches the queue (the rewrite is read-modify-write
+  and would race); if any entry is due it says so in a systemMessage instead.
   Appends (`printf >>` in
   SKILL.md) don't take the lock, so queuing an entry at the exact moment the
   hook rewrites the file can still drop it. Rare.

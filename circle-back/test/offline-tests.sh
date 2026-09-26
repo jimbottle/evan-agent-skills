@@ -213,18 +213,23 @@ printf '%s\tafter a killed holder\n' "$PAST" > "$Q"
 bash -c 'exec 9>>"$1"; perl -MFcntl=:flock -e "open(my \$f, q(>&=), 9); flock(\$f, LOCK_EX)"; kill -9 $$' _ "$Q.lock" 2>/dev/null
 assert_eq "killed holder leaves no stale lock" "after a killed holder" "$(fire "$Q" | reason_of)"
 
-head_ "9e. without flock or perl, only the session's own entries fire"
+head_ "9e. without flock or perl, the queue is left alone and the user told"
 NOLOCK_BIN="$WORK/nolock-bin"; mkdir -p "$NOLOCK_BIN"
 for t in bash jq shasum sha256sum date sed mktemp mv grep cut ps tr cat; do
   P=$(command -v "$t") && ln -sf "$P" "$NOLOCK_BIN/$t"
 done
 nolock_fire() { CIRCLE_BACK_QUEUE="$1" PATH="$NOLOCK_BIN" "$NOLOCK_BIN/bash" "$HOOK" <<< "$2"; }
 register "$MINE" $$
-printf '%s\tlegacy unlocked\n%s\t%s\tforeign unlocked\n%s\t%s\town unlocked\n' \
-  "$PAST" "$PAST" "$THEIRS" "$PAST" "$MINE" > "$Q"
-assert_eq "unlocked: own entry fires" "own unlocked" "$(nolock_fire "$Q" "$(as "$MINE")" | reason_of)"
-assert_eq "unlocked: legacy and orphaned entries left" "" "$(nolock_fire "$Q" "$(as "$MINE")" | reason_of)"
-assert_eq "unlocked: both still queued" "2" "$(grep -c unlocked "$Q")"
+printf '%s\t%s\town unlocked\n%s\tnot yet\n' "$PAST" "$MINE" "$(future)" > "$Q"
+OUT=$(nolock_fire "$Q" "$(as "$MINE")")
+assert_eq "unlocked: nothing fires" "" "$(reason_of <<<"$OUT")"
+case "$(jq -r '.systemMessage // empty' <<<"$OUT")" in
+  *"1 due"*flock*perl*) ok "unlocked: user told why" ;;
+  *) bad "unlocked: user told why" "$OUT" ;;
+esac
+assert_eq "unlocked: queue untouched" "2" "$(grep -c . "$Q")"
+printf '%s\tnot yet\n' "$(future)" > "$Q"
+assert_eq "unlocked: silent when nothing is due" "" "$(nolock_fire "$Q" "$(as "$MINE")")"
 rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
 
 # -------------------------------------------------------------- installer

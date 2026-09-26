@@ -101,9 +101,6 @@ eligible() {
   local tag rc
   tag=$(entry_sid "$1")
   [ -n "$tag" ] && [ -n "$SID" ] && [ "$tag" = "$SID" ] && return 0
-  # Without a lock, fire only our own entries -- nothing else stops there --
-  # so an entry another session could also pick can't fire twice.
-  [ "$LOCKED" = 1 ] || return 1
   if [ -z "$tag" ]; then [ "$ATTENDED" = "1" ]; return; fi
   [ "$ATTENDED" = "1" ] || return 1
   owner_live "$tag"; rc=$?
@@ -130,15 +127,22 @@ fi
 # Stop hook must not block): if it's held, skip -- a due entry fires next Stop.
 # Stock macOS has no flock(1); perl's flock locks the same open file, which
 # stays locked while this shell keeps fd 9 open.
-# With neither available, run unlocked but fire only this session's own
-# entries (see eligible).
+# With neither available, leave the queue untouched: the rewrite below is a
+# read-modify-write that would race unlocked. Say so if anything is due.
 exec 9>>"$QUEUE.lock" || exit 0
-LOCKED=0
 if command -v flock >/dev/null 2>&1; then
-  flock -n 9 || exit 0; LOCKED=1
+  flock -n 9 || exit 0
 elif command -v perl >/dev/null 2>&1; then
   perl -MFcntl=:flock -e 'open(my $f, ">&=", 9) or exit 2; flock($f, LOCK_EX|LOCK_NB) or exit 1' || exit 0
-  LOCKED=1
+else
+  DUE_N=0
+  while IFS= read -r LINE || [ -n "$LINE" ]; do
+    D=${LINE%%$'\t'*}; case "$D" in ''|*[!0-9]*) D=0 ;; esac
+    [ -n "$LINE" ] && [ "$D" -le "$NOW" ] && DUE_N=$((DUE_N+1))
+  done < "$QUEUE"
+  [ "$DUE_N" -gt 0 ] && jq -n --arg n "$DUE_N" --arg q "$QUEUE" \
+    '{systemMessage:("circle-back: " + $n + " due entr(y/ies) not fired -- needs flock or perl to lock " + $q)}'
+  exit 0
 fi
 
 # Find the due entry with the earliest due time (ties: earliest in file). A
