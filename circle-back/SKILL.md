@@ -149,8 +149,9 @@ overrides the file location.
 The one exception is an entry whose session is gone: `/clear` starts a new
 session id, and a closed or crashed terminal never stops again. The hook checks
 Claude Code's live-session registry (`~/.claude/sessions/<pid>.json`, which
-records each running session's pid and current id). Once a due entry's owner
-is no longer there, the next attended session that stops in the directory
-takes it over and fires it. Headless sessions never do. If the registry is
-missing, it falls back to adopting entries more than an hour overdue
+records each running session's pid, start time and current id). Once a due
+entry's owner is no longer running, the next attended session that stops in the
+directory takes it over and fires it. Headless sessions never do. If the
+registry is missing, or doesn't list the session doing the check (a sign its
+format changed), it falls back to adopting entries more than an hour overdue
 (`CIRCLE_BACK_ADOPT_AFTER` seconds).

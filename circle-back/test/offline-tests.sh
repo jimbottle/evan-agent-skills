@@ -134,8 +134,9 @@ Q="$WORK/sessions.queue"
 MINE=11111111-aaaa-bbbb-cccc-000000000001
 THEIRS=22222222-aaaa-bbbb-cccc-000000000002
 as() { jq -nc --arg s "$1" '{cwd:"/tmp",session_id:$s}'; }
-# THEIRS is a live session: registered under this test shell's pid.
-register() { jq -nc --argjson p "$2" --arg s "$1" '{pid:$p,sessionId:$s}' > "$CIRCLE_BACK_SESSIONS_DIR/$2.json"; }
+# Both sessions are live: registered under this test shell's pid.
+register() { jq -nc --argjson p "$2" --arg s "$1" '{pid:$p,sessionId:$s}' > "$CIRCLE_BACK_SESSIONS_DIR/$2-$1.json"; }
+register "$MINE" $$
 register "$THEIRS" $$
 printf '%s\t%s\tfor theirs\n%s\t%s\tfor mine\n' "$PAST" "$THEIRS" "$PAST" "$MINE" > "$Q"
 assert_eq "own tagged entry fires, tag stripped" "for mine" \
@@ -152,8 +153,16 @@ printf '%s\tdeadbeef\tcheck it\n' "$PAST" > "$Q"
 assert_eq "hex word in a legacy prompt is not a session tag" "deadbeef	check it" \
   "$(fire "$Q" "$(as "$MINE")" | reason_of)"
 
+printf '%s\t%s\tpretty\n' "$PAST" "$THEIRS" > "$Q"
+rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
+register "$MINE" $$
+jq -n --argjson p $$ --arg s "$THEIRS" '{pid:$p,sessionId:$s}' > "$CIRCLE_BACK_SESSIONS_DIR/pretty.json"
+assert_eq "pretty-printed registry still shows owner live" "" \
+  "$(fire "$Q" "$(as "$MINE")" | reason_of)"
+
 head_ "9c. orphaned entries are adopted once their session is gone"
 rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
+register "$MINE" $$
 DEAD=999999; while kill -0 "$DEAD" 2>/dev/null; do DEAD=$((DEAD-1)); done
 register "$THEIRS" "$DEAD"            # registered, but the process is gone
 printf '%s\t%s\torphaned\n' "$(( $(NOW) - 60 ))" "$THEIRS" > "$Q"
@@ -162,8 +171,14 @@ assert_eq "headless session does not adopt an orphan" "" \
 assert_eq "attended session adopts a dead session's due entry" "orphaned" \
   "$(fire "$Q" "$(as "$MINE")" | reason_of)"
 assert_eq "adopted orphan removed" "0" "$(grep -c . "$Q" 2>/dev/null | head -1)"
+printf '%s\t%s\tpid reused\n' "$(( $(NOW) - 60 ))" "$THEIRS" > "$Q"
+jq -nc --argjson p $$ --arg s "$THEIRS" '{pid:$p,sessionId:$s,procStart:"Sat Jan  1 00:00:00 2000"}' \
+  > "$CIRCLE_BACK_SESSIONS_DIR/reused.json"
+assert_eq "live pid with a different start time counts as gone" "pid reused" \
+  "$(fire "$Q" "$(as "$MINE")" | reason_of)"
 printf '%s\t%s\tunregistered\n' "$(( $(NOW) - 60 ))" "$THEIRS" > "$Q"
 rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
+register "$MINE" $$
 assert_eq "unregistered session counts as gone" "unregistered" \
   "$(fire "$Q" "$(as "$MINE")" | reason_of)"
 printf '%s\t%s\tno registry, recent\n%s\t%s\tno registry, old\n' \
@@ -172,15 +187,26 @@ assert_eq "no registry: hour-overdue entry adopted" "no registry, old" \
   "$(CIRCLE_BACK_SESSIONS_DIR="$WORK/nonexistent" fire "$Q" "$(as "$MINE")" | reason_of)"
 assert_eq "no registry: recently due entry left alone" "" \
   "$(CIRCLE_BACK_SESSIONS_DIR="$WORK/nonexistent" fire "$Q" "$(as "$MINE")" | reason_of)"
+rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json   # registry present, but doesn't list MINE
+assert_eq "registry without this session is not trusted" "" \
+  "$(fire "$Q" "$(as "$MINE")" | reason_of)"
 
 head_ "9d. select-and-remove is locked, never waited on"
 printf '%s\tlocked out\n' "$PAST" > "$Q"
-mkdir "$Q.lock"
+FIFO="$WORK/hold.fifo"; mkfifo "$FIFO"
+( exec 9>>"$Q.lock"
+  perl -MFcntl=:flock -e 'open(my $f, ">&=", 9) or exit 2; flock($f, LOCK_EX|LOCK_NB) or exit 1'
+  read -r _ < "$FIFO" ) &
+HOLDER=$!
+# Spin until the holder has the lock (probe exits 0 only when it's taken).
+until [ -e "$Q.lock" ] && perl -MFcntl=:flock -e 'open(my $f, ">>", $ARGV[0]) or exit 2; flock($f, LOCK_EX|LOCK_NB) and exit 1; exit 0' "$Q.lock"; do :; done
 assert_eq "held lock: hook skips this Stop" "" "$(fire "$Q" | reason_of)"
 assert_eq "held lock: entry kept" "1" "$(grep -c 'locked out' "$Q")"
-touch -t 200001010000 "$Q.lock"
-assert_eq "stale lock is broken" "locked out" "$(fire "$Q" | reason_of)"
-[ ! -e "$Q.lock" ] && ok "lock released after firing" || bad "lock released after firing"
+echo release > "$FIFO"; wait "$HOLDER"
+assert_eq "released lock: entry fires" "locked out" "$(fire "$Q" | reason_of)"
+printf '%s\tafter a killed holder\n' "$PAST" > "$Q"
+bash -c 'exec 9>>"$1"; perl -MFcntl=:flock -e "open(my \$f, q(>&=), 9); flock(\$f, LOCK_EX)"; kill -9 $$' _ "$Q.lock" 2>/dev/null
+assert_eq "killed holder leaves no stale lock" "after a killed holder" "$(fire "$Q" | reason_of)"
 
 # -------------------------------------------------------------- installer
 head_ "10. installer merges without clobbering existing config"

@@ -57,15 +57,39 @@ entry_sid() {
   if [ "$f2" != "$rest" ] && [[ "$f2" =~ $UUID_RE ]]; then printf '%s' "$f2"; fi
 }
 
+# Running sessions per the registry, one session id per line: only files whose
+# pid is alive and (when procStart is recorded) whose process started when the
+# registry says -- a crashed session's pid can be reused. Parsed with jq, not
+# grepped, so formatting changes can't hide a live session. Loaded lazily:
+# only a foreign tagged entry needs it.
+LIVE_SIDS=""; REG_LOADED=0; REG_OK=0
+load_registry() {
+  [ "$REG_LOADED" = 1 ] && return; REG_LOADED=1
+  [ -d "$SESSIONS_DIR" ] || return
+  local f row pid sid pstart actual
+  for f in "$SESSIONS_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    row=$(jq -r '[(.pid // "" | tostring), (.sessionId // ""), (.procStart // "")] | @tsv' "$f" 2>/dev/null) || continue
+    IFS=$'\t' read -r pid sid pstart <<<"$row"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    [ -n "$sid" ] || continue
+    kill -0 "$pid" 2>/dev/null || continue
+    if [ -n "$pstart" ]; then
+      actual=$(TZ=UTC ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
+      [ "$actual" = "$(printf '%s' "$pstart" | tr -s ' ')" ] || continue
+    fi
+    LIVE_SIDS="$LIVE_SIDS$sid"$'\n'
+  done
+  # The registry is trusted only if it knows this session; otherwise its
+  # format may have changed and "not listed" can't be read as "gone".
+  [ -n "$SID" ] && grep -qxF "$SID" <<<"$LIVE_SIDS" && REG_OK=1
+}
+
 # Is the session with this id still running?  0 = live, 1 = gone, 2 = unknown.
 owner_live() {
-  [ -d "$SESSIONS_DIR" ] || return 2
-  local f pid
-  for f in $(grep -l "\"sessionId\":\"$1\"" "$SESSIONS_DIR"/*.json 2>/dev/null); do
-    pid=$(jq -r '.pid // empty' "$f" 2>/dev/null)
-    case "$pid" in ''|*[!0-9]*) continue ;; esac
-    kill -0 "$pid" 2>/dev/null && return 0
-  done
+  load_registry
+  [ "$REG_OK" = 1 ] || return 2
+  grep -qxF "$1" <<<"$LIVE_SIDS" && return 0
   return 1
 }
 
@@ -95,17 +119,17 @@ fi
 [ -s "$QUEUE" ] || exit 0
 
 # Serialize select-and-remove: with adoption, two sessions stopping at once
-# could otherwise both fire the same entry. Never wait for the lock (a Stop
-# hook must not block); if it's held, skip -- a due entry fires next Stop.
-# A lock older than 30s is left over from a killed hook and is broken.
-LOCK="$QUEUE.lock"
-if ! mkdir "$LOCK" 2>/dev/null; then
-  MTIME=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK" 2>/dev/null || echo "$NOW")
-  if [ $(( NOW - MTIME )) -gt 30 ] && rmdir "$LOCK" 2>/dev/null && mkdir "$LOCK" 2>/dev/null; then :
-  else exit 0
-  fi
+# could otherwise both fire the same entry. flock(2) on fd 9, held until this
+# script exits, so a killed hook can't leave a stale lock behind. Never wait (a
+# Stop hook must not block): if it's held, skip -- a due entry fires next Stop.
+# Stock macOS has no flock(1); perl's flock locks the same open file, which
+# stays locked while this shell keeps fd 9 open.
+exec 9>>"$QUEUE.lock" || exit 0
+if command -v flock >/dev/null 2>&1; then
+  flock -n 9 || exit 0
+elif command -v perl >/dev/null 2>&1; then
+  perl -MFcntl=:flock -e 'open(my $f, ">&=", 9) or exit 2; flock($f, LOCK_EX|LOCK_NB) or exit 1' || exit 0
 fi
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
 # Find the due entry with the earliest due time (ties: earliest in file). A
 # not-yet-due entry does not block a later one that is due, so a 30s follow-up

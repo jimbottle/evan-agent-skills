@@ -321,14 +321,18 @@ Carry these into the report; none is a bug to fix in this pass.
   roborev reviewer (`claude -p` in the same repo) drained a queued
   `/roborev-fix` and answered it in its review output (2026-09-24). Legacy
   untagged entries fire only in an attended session.
-- The hook's select-and-remove takes a `mkdir` lock (`<queue>.lock`), so two
-  sessions stopping at once can't both fire an adopted entry. It never waits:
-  if the lock is held it skips that Stop, and a lock older than 30s is broken.
-  Appends (`printf >>` in SKILL.md) don't take the lock, so queuing an entry at
-  the exact moment the hook rewrites the file can still drop it. Rare.
+- The hook's select-and-remove holds `flock(2)` on `<queue>.lock` (flock(1)
+  where installed, else perl's flock, since stock macOS lacks flock(1)). The
+  lock dies with the process, so a killed hook leaves nothing stale. It never
+  waits: if the lock is held it skips that Stop. Appends (`printf >>` in
+  SKILL.md) don't take the lock, so queuing an entry at the exact moment the
+  hook rewrites the file can still drop it. Rare.
 - Adoption of a dead session's entries relies on `~/.claude/sessions/*.json`,
-  an internal Claude Code file, not a documented interface. If it disappears
-  the hook falls back to adopting entries an hour overdue.
+  an internal Claude Code file, not a documented interface. It is parsed with
+  jq, a pid counts only if it is alive and its start time matches `procStart`
+  (compared in UTC), and the registry is trusted only if it lists the calling
+  session. If it is missing or untrusted, the hook falls back to adopting
+  entries an hour overdue.
 - Prompts are one line each; newlines get collapsed. Queued prompts must be
   self-contained, since they arrive with the originating turn out of view.
 - `CronCreate` one-shots (the built-in scheduler behind `/loop`) fire only
