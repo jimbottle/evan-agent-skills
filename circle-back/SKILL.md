@@ -58,15 +58,16 @@ The middle field of the entry ties it to THIS session (see `after` below).
 
 Then schedule the wake-up. Load `CronCreate` with ToolSearch if it's deferred.
 Call it with the printed cron expression as `cron`, `recurring: false`, and
-this as `prompt`, filled in from the printed output and a few words of the
-queued prompt:
+this as `prompt`. Replace every `DUE` (in the prose and inside the one-liner)
+with the literal due epoch that was printed, `HH:MM:SS` with its clock time,
+and the quoted words with a few words of the queued prompt:
 
 > circle-back wake-up for the entry due at HH:MM:SS (epoch DUE): "first few
 > words...". Do nothing else this turn. If `date +%s` is still before DUE,
 > wait out the remaining seconds (a Bash `sleep`, or a Monitor until-loop on
 > `date +%s`). If you cannot wait, CronCreate this same prompt again
 > (`recurring: false`) at the expression printed by
-> `DUE=<epoch>; N=$(date +%s); T=$(( ((N+60>DUE?N+60:DUE)+59)/60*60 )); case $(date -r $T +%M) in 00|30) T=$((T+60));; esac; date -r $T '+%M %H %d %m' | awk '{print $1+0,$2+0,$3+0,$4+0,"*"}'`.
+> `N=$(date +%s); T=$(( ((N+60>DUE?N+60:DUE)+59)/60*60 )); case $(date -r $T +%M) in 00|30) T=$((T+60));; esac; date -r $T '+%M %H %d %m' | awk '{print $1+0,$2+0,$3+0,$4+0,"*"}'`.
 > Then end the turn with one short line. The Stop hook delivers the queued
 > prompt.
 
