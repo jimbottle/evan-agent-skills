@@ -19,11 +19,12 @@ $SRC/test/offline-tests.sh
 
 ## Definition of done
 
-- `bash test/offline-tests.sh` reports 0 failures (92 assertions)
+- `bash test/offline-tests.sh` reports 0 failures (103 assertions)
 - `/hooks` lists `circle-back.sh` under Stop
 - A single queued prompt fires after its delay, unprompted
 - Two queued prompts fire in order across consecutive turns
 - A due entry queued *after* a later-due one still fires first (due order, not file order)
+- An `after` entry behind a timed entry fires at the Stop after the timer's prompt ran
 - A queued prompt does not interrupt a long-running turn
 - A 30-minute delay leaves the session immediately responsive
 - Rollback verified as working
@@ -74,7 +75,7 @@ cd "$SRC" && bash test/offline-tests.sh
 ```
 
 **Pass condition:** final line reads `N passed, 0 failed`, exit status 0.
-Expect 45 assertions across 15 groups.
+Expect 103 assertions across 20 groups.
 
 Any failure → stop and report the failing group verbatim. Do not install over a
 red harness.
@@ -309,20 +310,24 @@ Carry these into the report; none is a bug to fix in this pass.
   `sleep` reappears in the script.
 - An `after` entry (due field `after:<queued_epoch>`) has no due time. It
   waits for every entry ahead of it in the file that the stopping session may
-  fire, due or not, and fires at the Stop that ends the turn the last of them
-  ran in. With nothing ahead of it, that is the end of the current turn. Once
-  free it goes before anything queued behind it. The queued time is used only
-  by the no-registry adoption fallback, in place of a due time. A `CronCreate`
-  job is not in the queue, so nothing can chain onto one.
+  fire, timed or not, due or not, and fires at the Stop that ends the turn
+  the last of them ran in. With nothing ahead of it, that is the end of the
+  current turn. Once free it goes before anything queued behind it. The
+  queued time is used only by the no-registry adoption fallback, in place of
+  a due time.
 - Firing is turn-driven, not timer-driven. A due entry is noticed at the first
   turn that *ends* at or after its due time, so nothing fires while the session
-  sits idle at the prompt or is closed. Because of this, the skill now uses the
-  built-in `CronCreate` tool (`recurring: false`) for any delay above 0, and
-  keeps the queue for delay 0 ("after this is done") and for sessions a
-  `/goal` or `/loop` keeps continuously busy. On 2026-09-23 a queued
+  sits idle at the prompt or is closed. On 2026-09-23 a queued
   `/circle-back 1080 /roborev-fix` sat unfired overnight because that session
-  never ended another turn. For a prompt that must fire with no session open,
-  use the `schedule` skill.
+  never ended another turn. For a while the skill answered this by sending
+  timed prompts through the built-in `CronCreate` tool instead of the queue,
+  but a cron job is invisible to the queue, so an `after` could not chain onto
+  a timer (2026-09-30). Now every delay is a queue entry with a due time, and
+  `CronCreate` (`recurring: false`) only schedules a wake-up prompt at the due
+  minute: a no-op turn whose Stop lets the hook fire the real entry. If the
+  session ended a turn after the due time first, the entry has already fired
+  and the wake-up is harmless. For a prompt that must fire with no session
+  open, use the `schedule` skill.
 - The queue file is keyed by working directory, but each entry carries the
   session id that queued it and fires only in that session. Before this, a
   roborev reviewer (`claude -p` in the same repo) drained a queued
@@ -351,8 +356,9 @@ Carry these into the report; none is a bug to fix in this pass.
   19:57 was still pending at 19:59 because a `/goal` Stop hook kept the session
   continuously busy, while queue entries fired at every Stop. The two
   mechanisms are complementary: the queue fires at turn boundaries and never
-  while idle; cron fires while idle and never mid-work. Pick by whether the
-  user will still be ending turns when the prompt is due.
+  while idle; cron fires while idle and never mid-work. That is why the cron
+  job is only a wake-up for a queue entry: whichever of the two happens
+  first, the entry fires once, in order with everything else queued.
 - Write queued test prompts so they carry their own follow-through. A prompt
   ending "reply with only X and do nothing else" leaves the session parked
   waiting on you — a test-design trap, not a product defect.

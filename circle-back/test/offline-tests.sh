@@ -154,6 +154,30 @@ assert_eq "timestamped after chains like a bare one" "A" "$(fire "$Q" | reason_o
 assert_eq "timestamped after fires next" "B" "$(fire "$Q" | reason_of)"
 rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
 
+head_ "6d. a timer stacks with an 'after' behind it; the cron wake-up is only a nudge"
+Q="$WORK/stack.queue"
+SID=33333333-aaaa-bbbb-cccc-000000000003
+register "$SID" $$
+# /circle-back 600 A ; /circle-back after B  -> A at its due time, B at the next Stop.
+printf '%s\t%s\tA: the timed command\nafter:%s\t%s\tB: once A has run\n' "$(future 600)" "$SID" "$(NOW)" "$SID" > "$Q"
+assert_eq "current turn ending fires nothing: B waits on A" "" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+assert_eq "an early wake-up turn (A not yet due) fires nothing" "" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+assert_eq "both still queued" "2" "$(grep -c . "$Q")"
+sed -i.bak "1s/^[0-9]*/$PAST/" "$Q"; rm -f "$Q.bak"           # the wake-up lands after A is due
+assert_eq "wake-up turn ends: A fires" "A: the timed command" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+assert_eq "A's turn ends: B fires" "B: once A has run" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+assert_eq "a late wake-up turn (entry already fired) is a no-op" "" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+# Timer, after, timer, after: each after waits for the whole timed chain ahead of it.
+printf '%s\t%s\tT1\nafter:%s\t%s\tA1\n%s\t%s\tT2\nafter:%s\t%s\tA2\n' \
+  "$PAST" "$SID" "$(NOW)" "$SID" "$(future 600)" "$SID" "$(NOW)" "$SID" > "$Q"
+assert_eq "stack 1/4: first timer" "T1" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+assert_eq "stack 2/4: its after" "A1" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+assert_eq "stack: second timer not due, its after waits" "" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+sed -i.bak "1s/^[0-9]*/$PAST/" "$Q"; rm -f "$Q.bak"
+assert_eq "stack 3/4: second timer" "T2" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+assert_eq "stack 4/4: its after" "A2" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
+
 head_ "7. malformed due time fires immediately"
 Q="$WORK/junk.queue"; printf 'abc\tbad due time\n' > "$Q"
 assert_eq "still fires" "bad due time" "$(fire "$Q" | reason_of)"

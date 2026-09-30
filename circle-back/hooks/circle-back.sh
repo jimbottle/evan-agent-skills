@@ -25,6 +25,13 @@
 # orphan when the owner's liveness is unknown (a bare `after` is also accepted,
 # and is then never adopted).
 #
+# A timed entry's clock is the built-in CronCreate scheduler: the skill also
+# schedules a one-shot wake-up prompt at the due minute, whose only job is to
+# end a turn so this hook runs. The hook knows nothing about cron; if a turn
+# ends after the due time before the wake-up arrives, the entry fires then and
+# the wake-up is a no-op. Keeping timers in the queue is what lets an `after`
+# entry chain onto one.
+#
 # Entries belong to the session that queued them. The queue file is keyed by
 # directory, and OTHER Claude Code sessions run in the same directory -- a
 # roborev reviewer (`claude -p`) finishing its review is a Stop too, and it

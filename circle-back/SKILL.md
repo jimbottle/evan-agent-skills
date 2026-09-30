@@ -6,23 +6,26 @@ description: Queue a follow-up prompt to be sent automatically once a delay has 
 
 # circle-back
 
-Hold a prompt and send it later. There are two triggers, and the choice
-matters:
+Hold a prompt and send it later. Every entry lives in one queue file, in the
+order it should run, and the `circle-back.sh` Stop hook fires the next due
+entry when a turn ends. There are two ways an entry comes due:
 
-- **A clock (`<seconds>`): the built-in `CronCreate` tool.** Claude Code's
-  own scheduler sends the prompt at the due minute, as long as the session is
-  open and at the prompt. If the session is busy then, it goes out as soon as
-  the current work finishes. It shows up in the terminal like any prompt you
-  typed.
-- **The previous task finishing (`after`): the Stop-hook queue.** A queue file
-  that the `circle-back.sh` Stop hook reads when a turn ends. An `after` entry
-  fires at the end of the turn in which the task ahead of it ran: the entry
-  queued before it if one is still pending, otherwise the work in flight right
-  now. No guessing how long the current work will take.
+- **A clock (`<seconds>`).** The entry carries an absolute due time. Because
+  the hook only runs when a turn *ends*, a session sitting idle at the prompt
+  would never notice the due time passing, so a one-shot `CronCreate` job is
+  scheduled for the due minute whose only job is to send a short wake-up
+  prompt. That wake-up ends a turn, the hook sees the entry is due, and the
+  real prompt goes out. If the session is busy at the due time, the entry
+  fires at the next turn end anyway and the wake-up, arriving later, is a
+  no-op.
+- **The previous task finishing (`after`).** The entry has no due time. It
+  waits for every entry ahead of it in the queue, timed or not, and fires at
+  the end of the turn in which the last of them ran. With nothing ahead of it,
+  that is the end of the work in flight right now.
 
-  The queue has no timer, so it only fires when a turn *ends*. A session left
-  at the prompt never ends another turn, so a timed entry here can sit unfired
-  for hours. Don't use it for timed delays, except in the case below.
+Because timers and `after` entries share one queue, they stack: a timer with a
+command, then an `after` behind it, runs the timer's prompt at its due time and
+the `after` prompt when that turn ends.
 
 ## Adding an entry
 
@@ -31,28 +34,50 @@ arguments to you as a trailing `ARGUMENTS: <seconds|after> <prompt>` line.
 The first token is either the delay in seconds or the word `after`; everything
 after it is the prompt, verbatim.
 
-### Delay greater than 0: schedule it with `CronCreate`
+### Delay greater than 0: queue entry plus a cron wake-up
 
-Load `CronCreate` with ToolSearch if it's deferred. Round the due time **up**
-to the next whole minute and build a one-shot cron expression:
+Every entry goes in the queue. First append it with its due time:
 
 ```bash
-T=$(( $(date +%s) + SECONDS_ARG + 59 ))
+Q="${CIRCLE_BACK_QUEUE:-$HOME/.claude/circle-back/$(printf '%s' "$PWD" | shasum -a 256 | cut -c1-12).queue}"
+mkdir -p "$(dirname "$Q")"
+DUE=$(( $(date +%s) + SECONDS_ARG ))
+printf '%s\t%s\t%s\n' "$DUE" "${CLAUDE_CODE_SESSION_ID:?no session id}" "$PROMPT_ARG" >> "$Q"
+```
+
+The middle field ties the entry to THIS session (see `after` below).
+
+Then schedule the wake-up. Load `CronCreate` with ToolSearch if it's deferred.
+Round the due time **up** to the next whole minute and build a one-shot cron
+expression:
+
+```bash
+T=$(( DUE + 59 ))
 date -r "$T" '+%M %H %d %m' | awk '{print $1+0, $2+0, $3+0, $4+0, "*"}'
 ```
 
-Call `CronCreate` with that expression as `cron`, the prompt as `prompt`, and
-`recurring: false`. Then confirm in one line: the due time (clock time, not
-just the delay) and a few words of the prompt. Keep the returned job ID in that
-line, since `CronDelete` needs it to cancel.
+Call `CronCreate` with that expression as `cron`, `recurring: false`, and this
+as `prompt` (fill in the due epoch, clock time and a few words of the queued
+prompt):
 
-Use the queue instead only when:
+> circle-back wake-up for the entry due at HH:MM:SS (epoch DUE): "first few
+> words...". Do nothing else this turn. If `date +%s` is still before DUE,
+> wait out the remaining seconds (a Bash `sleep`, or a Monitor until-loop on
+> `date +%s` if sleep is blocked). Then end the turn with one short line. The
+> Stop hook delivers the queued prompt.
 
-- `CronCreate` isn't available in this session, or
-- the session will be kept continuously busy past the due time (a `/goal` or
-  `/loop` whose Stop hook keeps blocking). Cron only fires at idle moments, so
-  it won't fire until that loop stops. The queue fires at every turn end, so it
-  keeps working.
+The wake-up carries no work of its own, so it is harmless if the entry has
+already fired (the session ended a turn after the due time) or was cancelled.
+
+Confirm in one line: the due time (clock time, not just the delay), a few
+words of the prompt, and the cron job ID (`CronDelete` needs it to cancel).
+
+If `CronCreate` isn't available in this session, queue the entry anyway and
+say plainly that it fires at the first turn end after the due time, not on
+the clock. A session that is kept continuously busy (a `/goal` or `/loop`
+whose Stop hook keeps blocking) needs no special handling: the entry fires at
+the first turn end after it is due, and the wake-up, which cron only sends at
+an idle moment, arrives later as a no-op.
 
 ### `after`, "after this is done", "then...": append to the queue
 
@@ -71,22 +96,22 @@ never in another Claude Code session that stops in the same directory (a
 roborev reviewer, a subagent, a second terminal).
 
 An `after` entry waits for every entry ahead of it in this session's queue,
-due or not, and fires at the end of the turn the last of them ran in. With
-nothing ahead of it, that is the end of the current turn. Several `after`
-entries in a row run in order, one per turn.
+timed or not, due or not, and fires at the end of the turn the last of them
+ran in. With nothing ahead of it, that is the end of the current turn. Several
+`after` entries in a row run in order, one per turn. A timed entry ahead of it
+is what makes stacking work: `/circle-back 600 check the deploy` followed by
+`/circle-back after tell me if it passed` runs the check at its due time and
+the report when the check's turn ends.
 
 Before confirming, look at what is ahead of it (the listing under "Inspecting
 what's pending", filtered to this session) and say so: "fires after 'check the
 deploy' (due 11:00)" or "fires when the current work ends". The user may have
 meant the other one.
 
-A `CronCreate` job is not in the queue, so nothing can chain onto it. When the
-user wants B after a task A that is scheduled with cron, `CronDelete` A and
-`CronCreate` it again with both prompts in one: "A. When that is done, B."
-
 ### Delay 0: due now, ahead of anything pending
 
-A `0` delay writes a queue entry with the current time as its due time:
+A `0` delay is a timed entry with the current time as its due time and no
+cron wake-up (the current turn ending is the wake-up):
 
 ```bash
 printf '%s\t%s\t%s\n' "$(date +%s)" "${CLAUDE_CODE_SESSION_ID:?no session id}" "$PROMPT_ARG" >> "$Q"
@@ -103,19 +128,25 @@ Scheduling is the whole job.
 
 ## Limits to tell the user about
 
-- **The session has to stay open.** Both mechanisms live in this Claude Code
-  session. `CronCreate` jobs are in memory only and are gone when Claude exits
-  (they do not survive a restart or `--resume`). If the machine sleeps, the job
-  fires when it wakes, as long as the session is still open. For prompts that
-  must run with no session open, use the `schedule` skill (cloud routines).
-- **Cron granularity is one minute.** One-shots due at :00 or :30 can fire up
-  to 90 s early. For an approximate delay, a minute off the :00/:30 marks is
-  fine.
-- **Queue entries fire only when a turn ends.** If you did use the queue for a
-  timed entry, say plainly that it waits for the next turn to end after the
-  due time, not for the clock.
+- **The session has to stay open.** The queue and the wake-up both live in
+  this Claude Code session. `CronCreate` jobs are in memory only and are gone
+  when Claude exits (they do not survive a restart or `--resume`); the queue
+  entry survives, but with no wake-up it fires only at the first turn end
+  after its due time, and only once an attended session in this directory
+  adopts it. If the machine sleeps, the wake-up fires when it wakes, as long
+  as the session is still open. For prompts that must run with no session
+  open, use the `schedule` skill (cloud routines).
+- **Cron granularity is one minute.** The wake-up lands at the due minute,
+  and one-shots due at :00 or :30 can arrive up to 90 s early. The wake-up
+  prompt tells the agent to sleep off any remainder, so the entry still fires
+  at or after its due second; the cost is a minute of slop at most.
+- **Queue entries fire only when a turn ends.** Without the wake-up (no
+  `CronCreate` in the session), say plainly that the entry waits for the next
+  turn to end after the due time, not for the clock.
 - **An `after` entry waits for everything ahead of it in the queue,** even an
   entry due hours from now. Say what it is waiting on when you confirm.
+- **The wake-up is a visible turn.** It shows in the transcript as a prompt
+  and a one-line reply before the queued prompt runs.
 
 ## Rules
 
@@ -132,12 +163,12 @@ Scheduling is the whole job.
   rather than asking.
 - If the user gives no delay, use `after`. It goes in the queue and fires when
   the previous task completes.
-- Beyond a few hours, prefer the `schedule` skill. Both mechanisms need the
-  session to still be open.
+- Beyond a few hours, prefer the `schedule` skill. The queue and its wake-up
+  both need the session to still be open.
 
 ## Inspecting what's pending
 
-Scheduled cron jobs: `CronList`; cancel one with `CronDelete <id>`.
+The queue is the source of truth. `CronList` shows only the wake-ups.
 
 Queue entries, in file order, with due times rendered (a legacy two-field
 entry shows its prompt in the session column):
@@ -162,6 +193,11 @@ Drop a single entry by line number:
 ```bash
 sed "${N}d" "$Q" > "$Q.tmp" && mv "$Q.tmp" "$Q"
 ```
+
+Cancelling a timed entry means dropping its queue line; its wake-up is then a
+harmless no-op, but `CronDelete` it too (`CronList` to find it) so it never
+shows up. Deleting only the cron job does not cancel anything: the entry still
+fires at the next turn end after its due time.
 
 ## How the queue fires
 
