@@ -75,7 +75,7 @@ cd "$SRC" && bash test/offline-tests.sh
 ```
 
 **Pass condition:** final line reads `N passed, 0 failed`, exit status 0.
-Expect 103 assertions across 20 groups.
+Expect 103 assertions across 21 groups.
 
 Any failure → stop and report the failing group verbatim. Do not install over a
 red harness.

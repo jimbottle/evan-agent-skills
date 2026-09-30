@@ -36,35 +36,37 @@ after it is the prompt, verbatim.
 
 ### Delay greater than 0: queue entry plus a cron wake-up
 
-Every entry goes in the queue. First append it with its due time:
+Every entry goes in the queue. Append it with its due time and, in the same
+Bash call (shell variables do not survive between calls), print what the
+wake-up needs: the due epoch, its clock time, and the cron expression. The
+wake-up minute is the due time rounded **up** to a whole minute, pushed one
+more minute when that lands on :00 or :30, since one-shots at those marks can
+arrive up to 90 s early.
 
 ```bash
 Q="${CIRCLE_BACK_QUEUE:-$HOME/.claude/circle-back/$(printf '%s' "$PWD" | shasum -a 256 | cut -c1-12).queue}"
 mkdir -p "$(dirname "$Q")"
 DUE=$(( $(date +%s) + SECONDS_ARG ))
 printf '%s\t%s\t%s\n' "$DUE" "${CLAUDE_CODE_SESSION_ID:?no session id}" "$PROMPT_ARG" >> "$Q"
+T=$(( (DUE + 59) / 60 * 60 ))
+case $(date -r "$T" +%M) in 00|30) T=$(( T + 60 )) ;; esac
+echo "due=$DUE at $(date -r "$DUE" +%H:%M:%S); wake-up $(date -r "$T" +%H:%M)"
+echo "cron: $(date -r "$T" '+%M %H %d %m' | awk '{print $1+0, $2+0, $3+0, $4+0, "*"}')"
 ```
 
-The middle field ties the entry to THIS session (see `after` below).
+The middle field of the entry ties it to THIS session (see `after` below).
 
 Then schedule the wake-up. Load `CronCreate` with ToolSearch if it's deferred.
-Round the due time **up** to the next whole minute and build a one-shot cron
-expression:
-
-```bash
-T=$(( DUE + 59 ))
-date -r "$T" '+%M %H %d %m' | awk '{print $1+0, $2+0, $3+0, $4+0, "*"}'
-```
-
-Call `CronCreate` with that expression as `cron`, `recurring: false`, and this
-as `prompt` (fill in the due epoch, clock time and a few words of the queued
-prompt):
+Call it with the printed cron expression as `cron`, `recurring: false`, and
+this as `prompt`, filled in from the printed output and a few words of the
+queued prompt:
 
 > circle-back wake-up for the entry due at HH:MM:SS (epoch DUE): "first few
 > words...". Do nothing else this turn. If `date +%s` is still before DUE,
 > wait out the remaining seconds (a Bash `sleep`, or a Monitor until-loop on
-> `date +%s` if sleep is blocked). Then end the turn with one short line. The
-> Stop hook delivers the queued prompt.
+> `date +%s`); if you cannot wait, CronCreate this same wake-up one minute
+> later. Then end the turn with one short line. The Stop hook delivers the
+> queued prompt.
 
 The wake-up carries no work of its own, so it is harmless if the entry has
 already fired (the session ended a turn after the due time) or was cancelled.
@@ -136,10 +138,11 @@ Scheduling is the whole job.
   adopts it. If the machine sleeps, the wake-up fires when it wakes, as long
   as the session is still open. For prompts that must run with no session
   open, use the `schedule` skill (cloud routines).
-- **Cron granularity is one minute.** The wake-up lands at the due minute,
-  and one-shots due at :00 or :30 can arrive up to 90 s early. The wake-up
-  prompt tells the agent to sleep off any remainder, so the entry still fires
-  at or after its due second; the cost is a minute of slop at most.
+- **Cron granularity is one minute.** The wake-up lands at the due time
+  rounded up to the minute, or one minute later when that is :00 or :30
+  (one-shots at those marks can arrive up to 90 s early). The wake-up prompt
+  also tells the agent to sleep off any remainder, so the entry fires at or
+  after its due second; the cost is up to two minutes of slop.
 - **Queue entries fire only when a turn ends.** Without the wake-up (no
   `CronCreate` in the session), say plainly that the entry waits for the next
   turn to end after the due time, not for the clock.
