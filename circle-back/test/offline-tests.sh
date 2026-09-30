@@ -139,8 +139,19 @@ printf '%s\t%s\ttheirs, pending\nafter\t%s\tmine\n' "$(future 3600)" "$THEIRS" "
 assert_eq "another live session's entry is not 'ahead'" "mine" "$(fire "$Q" "$(as "$MINE")" | reason_of)"
 printf 'after\t%s\ttheirs, after\n' "$THEIRS" > "$Q"
 assert_eq "a live session's after entry is not adopted" "" "$(fire "$Q" "$(as "$MINE")" | reason_of)"
-assert_eq "no registry: an after entry is never adopted by overdue-ness" "" \
+assert_eq "no registry: a bare after entry is never adopted" "" \
   "$(CIRCLE_BACK_SESSIONS_DIR="$WORK/nonexistent" fire "$Q" "$(as "$MINE")" | reason_of)"
+printf 'after:%s\t%s\tqueued long ago\n' "$(( $(NOW) - 7200 ))" "$THEIRS" > "$Q"
+assert_eq "no registry: after entry queued over an hour ago is adopted" "queued long ago" \
+  "$(CIRCLE_BACK_SESSIONS_DIR="$WORK/nonexistent" fire "$Q" "$(as "$MINE")" | reason_of)"
+printf 'after:%s\t%s\tqueued just now\n' "$(( $(NOW) - 60 ))" "$THEIRS" > "$Q"
+assert_eq "no registry: recently queued after entry left alone" "" \
+  "$(CIRCLE_BACK_SESSIONS_DIR="$WORK/nonexistent" fire "$Q" "$(as "$MINE")" | reason_of)"
+printf 'after:%s\t%s\tqueued long ago, owner live\n' "$(( $(NOW) - 7200 ))" "$THEIRS" > "$Q"
+assert_eq "live owner: old after entry still not adopted" "" "$(fire "$Q" "$(as "$MINE")" | reason_of)"
+printf '%s\tA\nafter:%s\tB\n' "$PAST" "$(NOW)" > "$Q"
+assert_eq "timestamped after chains like a bare one" "A" "$(fire "$Q" | reason_of)"
+assert_eq "timestamped after fires next" "B" "$(fire "$Q" | reason_of)"
 rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
 
 head_ "7. malformed due time fires immediately"

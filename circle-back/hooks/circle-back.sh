@@ -14,13 +14,16 @@
 #
 # Queue file format, one entry per line:
 #   <due_epoch_seconds><TAB><session_id><TAB><prompt>   (current)
-#   after<TAB><session_id><TAB><prompt>                 (fires after the task ahead of it)
+#   after:<queued_epoch><TAB><session_id><TAB><prompt>  (fires after the task ahead of it)
 #   <due_epoch_seconds><TAB><prompt>                    (legacy, untagged)
 #
-# An `after` entry has no clock. It waits for every entry ahead of it in the
-# file that this session may fire -- due or not -- and comes due the moment
-# none is left, i.e. at the Stop that ends the turn the last of them ran in.
-# With nothing ahead of it, that is the end of the current turn.
+# An `after` entry has no due time. It waits for every entry ahead of it in
+# the file that this session may fire -- due or not -- and comes due the
+# moment none is left, i.e. at the Stop that ends the turn the last of them
+# ran in. With nothing ahead of it, that is the end of the current turn. The
+# epoch after the colon is when it was queued; it only matters for adopting an
+# orphan when the owner's liveness is unknown (a bare `after` is also accepted,
+# and is then never adopted).
 #
 # Entries belong to the session that queued them. The queue file is keyed by
 # directory, and OTHER Claude Code sessions run in the same directory -- a
@@ -102,7 +105,9 @@ owner_live() {
   return 1
 }
 
-# May THIS session fire the entry?  eligible <line> <due> <is_after>
+# May THIS session fire the entry?  eligible <line> <ref_epoch>
+# ref_epoch is the due time, or for an `after` entry the time it was queued
+# (empty when unknown).
 eligible() {
   local tag rc
   tag=$(entry_sid "$1")
@@ -111,8 +116,8 @@ eligible() {
   [ "$ATTENDED" = "1" ] || return 1
   owner_live "$tag"; rc=$?
   [ "$rc" -eq 1 ] && return 0
-  # Unknown liveness: adopt only by overdue-ness, which an `after` entry has none of.
-  [ "$rc" -eq 2 ] && [ "$3" != 1 ] && [ $(( NOW - $2 )) -ge "$ADOPT_AFTER" ]
+  # Unknown liveness: adopt only once ADOPT_AFTER has passed since the reference time.
+  [ "$rc" -eq 2 ] && [ -n "$2" ] && [ $(( NOW - $2 )) -ge "$ADOPT_AFTER" ]
 }
 
 # Scan the queue once. Sets TARGET (line number of the entry to fire, 0 if
@@ -125,7 +130,7 @@ eligible() {
 # session may fire, and once unblocked counts as due since forever (due 0), so
 # it goes before anything queued behind it.
 scan() {
-  local LINE DUE AFTER AHEAD=0
+  local LINE DUE AFTER REF AHEAD=0
   TARGET=0; BEST=0; DUE_N=0; N=0
   while IFS= read -r LINE || [ -n "$LINE" ]; do
     N=$((N+1))
@@ -133,10 +138,12 @@ scan() {
     DUE=${LINE%%$'\t'*}
     AFTER=0
     case "$DUE" in
-      after) AFTER=1; DUE=0 ;;
-      ''|*[!0-9]*) DUE=0 ;;                     # malformed -> due immediately
+      after|after:*) AFTER=1; REF=${DUE#after}; REF=${REF#:}; DUE=0
+                     case "$REF" in *[!0-9]*) REF= ;; esac ;;
+      ''|*[!0-9]*) DUE=0; REF=0 ;;              # malformed -> due immediately
+      *) REF=$DUE ;;
     esac
-    eligible "$LINE" "$DUE" "$AFTER" || continue  # another session's entry: leave it
+    eligible "$LINE" "$REF" || continue          # another session's entry: leave it
     if [ "$AFTER" = 1 ] && [ "$AHEAD" = 1 ]; then continue; fi  # waits for what is ahead
     AHEAD=1
     [ "$DUE" -le "$NOW" ] || continue

@@ -59,8 +59,12 @@ Use the queue instead only when:
 ```bash
 Q="${CIRCLE_BACK_QUEUE:-$HOME/.claude/circle-back/$(printf '%s' "$PWD" | shasum -a 256 | cut -c1-12).queue}"
 mkdir -p "$(dirname "$Q")"
-printf 'after\t%s\t%s\n' "${CLAUDE_CODE_SESSION_ID:?no session id}" "$PROMPT_ARG" >> "$Q"
+printf 'after:%s\t%s\t%s\n' "$(date +%s)" "${CLAUDE_CODE_SESSION_ID:?no session id}" "$PROMPT_ARG" >> "$Q"
 ```
+
+The first field is the word `after` plus the time it was queued. The hook
+never uses that time to fire it; it is only there so an orphaned entry can be
+adopted later (see "How the queue fires").
 
 The middle field ties the entry to THIS session: the hook fires it only here,
 never in another Claude Code session that stops in the same directory (a
@@ -141,7 +145,7 @@ entry shows its prompt in the session column):
 ```bash
 while IFS=$'\t' read -r due sid prompt; do
   case "$due" in
-    after) printf 'after the task ahead    [%s]  %s\n' "${sid:0:8}" "$prompt" ;;
+    after*) printf 'after the task ahead    [%s]  %s\n' "${sid:0:8}" "$prompt" ;;
     *) printf '%s  (in %ss)  [%s]  %s\n' "$(date -r "$due" '+%H:%M:%S')" "$(( due - $(date +%s) ))" "${sid:0:8}" "$prompt" ;;
   esac
 done < "$Q"
@@ -172,7 +176,9 @@ An `after` entry has no due time. It is skipped while any entry ahead of it in
 the file is one this session may fire; once none is left it counts as due, and
 fires at that Stop. Since each fire removes one line and the fired prompt runs
 in the next turn, "the entry ahead of it is gone" and "the previous task's
-turn has ended" are the same moment.
+turn has ended" are the same moment. When the registry can't say whether an
+`after` entry's owner is still running, the hour-overdue fallback measures
+from the time it was queued instead.
 
 The hook never sleeps. Stop hooks run synchronously and Claude Code blocks on
 them, so a hook that slept for the delay would freeze the whole session for that
