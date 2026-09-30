@@ -14,7 +14,13 @@
 #
 # Queue file format, one entry per line:
 #   <due_epoch_seconds><TAB><session_id><TAB><prompt>   (current)
+#   after<TAB><session_id><TAB><prompt>                 (fires after the task ahead of it)
 #   <due_epoch_seconds><TAB><prompt>                    (legacy, untagged)
+#
+# An `after` entry has no clock. It waits for every entry ahead of it in the
+# file that this session may fire -- due or not -- and comes due the moment
+# none is left, i.e. at the Stop that ends the turn the last of them ran in.
+# With nothing ahead of it, that is the end of the current turn.
 #
 # Entries belong to the session that queued them. The queue file is keyed by
 # directory, and OTHER Claude Code sessions run in the same directory -- a
@@ -96,7 +102,7 @@ owner_live() {
   return 1
 }
 
-# May THIS session fire the entry?  eligible <line> <due>
+# May THIS session fire the entry?  eligible <line> <due> <is_after>
 eligible() {
   local tag rc
   tag=$(entry_sid "$1")
@@ -105,7 +111,38 @@ eligible() {
   [ "$ATTENDED" = "1" ] || return 1
   owner_live "$tag"; rc=$?
   [ "$rc" -eq 1 ] && return 0
-  [ "$rc" -eq 2 ] && [ $(( NOW - $2 )) -ge "$ADOPT_AFTER" ]
+  # Unknown liveness: adopt only by overdue-ness, which an `after` entry has none of.
+  [ "$rc" -eq 2 ] && [ "$3" != 1 ] && [ $(( NOW - $2 )) -ge "$ADOPT_AFTER" ]
+}
+
+# Scan the queue once. Sets TARGET (line number of the entry to fire, 0 if
+# none), BEST (its due time) and DUE_N (how many entries this session could
+# fire right now). Picks the due entry with the earliest due time (ties:
+# earliest in file). A not-yet-due entry does not block a later one that is
+# due, so a 30s follow-up queued behind a 2h one still fires on time -- and a
+# due entry queued *after* a later-due one does not jump ahead of it. The one
+# exception is an `after` entry: it waits for everything ahead of it that this
+# session may fire, and once unblocked counts as due since forever (due 0), so
+# it goes before anything queued behind it.
+scan() {
+  local LINE DUE AFTER AHEAD=0
+  TARGET=0; BEST=0; DUE_N=0; N=0
+  while IFS= read -r LINE || [ -n "$LINE" ]; do
+    N=$((N+1))
+    [ -n "$LINE" ] || continue
+    DUE=${LINE%%$'\t'*}
+    AFTER=0
+    case "$DUE" in
+      after) AFTER=1; DUE=0 ;;
+      ''|*[!0-9]*) DUE=0 ;;                     # malformed -> due immediately
+    esac
+    eligible "$LINE" "$DUE" "$AFTER" || continue  # another session's entry: leave it
+    if [ "$AFTER" = 1 ] && [ "$AHEAD" = 1 ]; then continue; fi  # waits for what is ahead
+    AHEAD=1
+    [ "$DUE" -le "$NOW" ] || continue
+    DUE_N=$((DUE_N+1))
+    if [ "$TARGET" -eq 0 ] || [ "$DUE" -lt "$BEST" ]; then TARGET=$N; BEST=$DUE; fi
+  done < "$QUEUE"
 }
 
 # Queue is scoped per working directory so parallel sessions in different
@@ -135,34 +172,14 @@ if command -v flock >/dev/null 2>&1; then
 elif command -v perl >/dev/null 2>&1; then
   perl -MFcntl=:flock -e 'open(my $f, ">&=", 9) or exit 2; flock($f, LOCK_EX|LOCK_NB) or exit 1' || exit 0
 else
-  DUE_N=0
-  while IFS= read -r LINE || [ -n "$LINE" ]; do
-    D=${LINE%%$'\t'*}; case "$D" in ''|*[!0-9]*) D=0 ;; esac
-    # Count only entries this session would fire; others aren't its to report.
-    [ -n "$LINE" ] && [ "$D" -le "$NOW" ] && eligible "$LINE" "$D" && DUE_N=$((DUE_N+1))
-  done < "$QUEUE"
+  # Count only entries this session would fire; others aren't its to report.
+  scan
   [ "$DUE_N" -gt 0 ] && jq -n --arg n "$DUE_N" --arg q "$QUEUE" \
     '{systemMessage:("circle-back: " + $n + " due entr(y/ies) not fired -- needs flock or perl to lock " + $q)}'
   exit 0
 fi
 
-# Find the due entry with the earliest due time (ties: earliest in file). A
-# not-yet-due entry does not block a later one that is due, so a 30s follow-up
-# queued behind a 2h one still fires on time -- and a due entry queued *after*
-# a later-due one does not jump ahead of it.
-TARGET=0
-BEST=0
-N=0
-while IFS= read -r LINE || [ -n "$LINE" ]; do
-  N=$((N+1))
-  [ -n "$LINE" ] || continue
-  DUE=${LINE%%$'\t'*}
-  case "$DUE" in ''|*[!0-9]*) DUE=0 ;; esac   # malformed -> due immediately
-  eligible "$LINE" "$DUE" || continue        # another session's entry: leave it
-  if [ "$DUE" -le "$NOW" ] && { [ "$TARGET" -eq 0 ] || [ "$DUE" -lt "$BEST" ]; }; then
-    TARGET=$N; BEST=$DUE
-  fi
-done < "$QUEUE"
+scan
 
 # Nothing due yet: end the turn normally. This is the common case and is what
 # keeps the session interactive while long entries are pending.

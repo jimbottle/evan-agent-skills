@@ -103,6 +103,46 @@ Q="$WORK/tie.queue"
 printf '%s\ttie A\n%s\ttie B\n' "$PAST" "$PAST" > "$Q"
 assert_eq "equal due times keep queue order" "tie A" "$(fire "$Q" | reason_of)"
 
+head_ "6c. an 'after' entry fires once everything ahead of it has fired"
+Q="$WORK/after.queue"
+# Nothing ahead of it: fires at the end of the current turn, like delay 0.
+printf 'after\tright after this\n' > "$Q"
+assert_eq "alone: fires now" "right after this" "$(fire "$Q" | reason_of)"
+# Behind a not-yet-due entry: waits for it, then goes at the very next Stop.
+printf '%s\tthe timed one\nafter\tthen this\n' "$(future 3600)" > "$Q"
+assert_eq "blocked by a pending entry ahead" "" "$(fire "$Q")"
+assert_eq "both retained while waiting" "2" "$(grep -c . "$Q")"
+sed -i.bak "1s/^[0-9]*/$PAST/" "$Q"; rm -f "$Q.bak"           # the timed one comes due
+assert_eq "the timed one fires first" "the timed one" "$(fire "$Q" | reason_of)"
+assert_eq "the chained one fires at the next Stop" "then this" "$(fire "$Q" | reason_of)"
+# A due entry queued behind an 'after' does not jump ahead of it.
+printf 'after\tfirst in file\n%s\tdue, queued later\n' "$PAST" > "$Q"
+assert_eq "unblocked after goes before a later due entry" "first in file" "$(fire "$Q" | reason_of)"
+# A due entry queued behind a *blocked* 'after' still fires on time.
+printf '%s\tpending\nafter\twaiting on pending\n%s\tdue now\n' "$(future 3600)" "$PAST" > "$Q"
+assert_eq "due entry passes a blocked after" "due now" "$(fire "$Q" | reason_of)"
+assert_eq "blocked after left in place" "1" "$(grep -c 'waiting on pending' "$Q")"
+# Chained afters run in file order, one per Stop.
+printf '%s\tA\nafter\tB\nafter\tC\n' "$PAST" > "$Q"
+assert_eq "chain 1/3" "A" "$(fire "$Q" | reason_of)"
+assert_eq "chain 2/3" "B" "$(fire "$Q" | reason_of)"
+assert_eq "chain 3/3" "C" "$(fire "$Q" | reason_of)"
+assert_eq "chain drained" "0" "$(grep -c . "$Q" 2>/dev/null | head -1)"
+# Only entries THIS session may fire count as "ahead": a live other session's
+# entry does not hold up my 'after'.
+MINE=11111111-aaaa-bbbb-cccc-000000000001
+THEIRS=22222222-aaaa-bbbb-cccc-000000000002
+as() { jq -nc --arg s "$1" '{cwd:"/tmp",session_id:$s}'; }
+register() { jq -nc --argjson p "$2" --arg s "$1" '{pid:$p,sessionId:$s}' > "$CIRCLE_BACK_SESSIONS_DIR/$2-$1.json"; }
+register "$MINE" $$; register "$THEIRS" $$
+printf '%s\t%s\ttheirs, pending\nafter\t%s\tmine\n' "$(future 3600)" "$THEIRS" "$MINE" > "$Q"
+assert_eq "another live session's entry is not 'ahead'" "mine" "$(fire "$Q" "$(as "$MINE")" | reason_of)"
+printf 'after\t%s\ttheirs, after\n' "$THEIRS" > "$Q"
+assert_eq "a live session's after entry is not adopted" "" "$(fire "$Q" "$(as "$MINE")" | reason_of)"
+assert_eq "no registry: an after entry is never adopted by overdue-ness" "" \
+  "$(CIRCLE_BACK_SESSIONS_DIR="$WORK/nonexistent" fire "$Q" "$(as "$MINE")" | reason_of)"
+rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
+
 head_ "7. malformed due time fires immediately"
 Q="$WORK/junk.queue"; printf 'abc\tbad due time\n' > "$Q"
 assert_eq "still fires" "bad due time" "$(fire "$Q" | reason_of)"
@@ -230,6 +270,8 @@ esac
 assert_eq "unlocked: queue untouched" "2" "$(grep -c . "$Q")"
 printf '%s\tnot yet\n' "$(future)" > "$Q"
 assert_eq "unlocked: silent when nothing is due" "" "$(nolock_fire "$Q" "$(as "$MINE")")"
+printf '%s\tnot yet\nafter\tblocked after\n' "$(future)" > "$Q"
+assert_eq "unlocked: silent when only a blocked after is queued" "" "$(nolock_fire "$Q" "$(as "$MINE")")"
 register "$THEIRS" $$
 printf '%s\t%s\ttheirs, live\n%s\tlegacy\n' "$PAST" "$THEIRS" "$PAST" > "$Q"
 assert_eq "unlocked: headless session silent about others' entries" "" \

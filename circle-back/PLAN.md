@@ -19,7 +19,7 @@ $SRC/test/offline-tests.sh
 
 ## Definition of done
 
-- `bash test/offline-tests.sh` reports 0 failures (45 assertions)
+- `bash test/offline-tests.sh` reports 0 failures (87 assertions)
 - `/hooks` lists `circle-back.sh` under Stop
 - A single queued prompt fires after its delay, unprompted
 - Two queued prompts fire in order across consecutive turns
@@ -307,6 +307,12 @@ Carry these into the report; none is a bug to fix in this pass.
   an absolute due time and the hook exits in milliseconds when nothing is due.
   Test group 5 is the regression guard; group 0 fails the build if a bare
   `sleep` reappears in the script.
+- An `after` entry (due field is the word `after`) has no clock. It waits for
+  every entry ahead of it in the file that the stopping session may fire, due
+  or not, and fires at the Stop that ends the turn the last of them ran in.
+  With nothing ahead of it, that is the end of the current turn. Once free it
+  goes before anything queued behind it. A `CronCreate` job is not in the
+  queue, so nothing can chain onto one.
 - Firing is turn-driven, not timer-driven. A due entry is noticed at the first
   turn that *ends* at or after its due time, so nothing fires while the session
   sits idle at the prompt or is closed. Because of this, the skill now uses the
