@@ -64,9 +64,11 @@ queued prompt:
 > circle-back wake-up for the entry due at HH:MM:SS (epoch DUE): "first few
 > words...". Do nothing else this turn. If `date +%s` is still before DUE,
 > wait out the remaining seconds (a Bash `sleep`, or a Monitor until-loop on
-> `date +%s`); if you cannot wait, CronCreate this same wake-up one minute
-> later. Then end the turn with one short line. The Stop hook delivers the
-> queued prompt.
+> `date +%s`). If you cannot wait, CronCreate this same prompt again
+> (`recurring: false`) at the expression printed by
+> `T=$(( ($(date +%s)/60+1)*60 )); case $(date -r $T +%M) in 00|30) T=$((T+60));; esac; date -r $T '+%M %H %d %m' | awk '{print $1+0,$2+0,$3+0,$4+0,"*"}'`.
+> Then end the turn with one short line. The Stop hook delivers the queued
+> prompt.
 
 The wake-up carries no work of its own, so it is harmless if the entry has
 already fired (the session ended a turn after the due time) or was cancelled.
@@ -197,10 +199,12 @@ Drop a single entry by line number:
 sed "${N}d" "$Q" > "$Q.tmp" && mv "$Q.tmp" "$Q"
 ```
 
-Cancelling a timed entry means dropping its queue line; its wake-up is then a
-harmless no-op, but `CronDelete` it too (`CronList` to find it) so it never
-shows up. Deleting only the cron job does not cancel anything: the entry still
-fires at the next turn end after its due time.
+Cancelling a timed entry means dropping its queue line. That is the whole
+cancel: every wake-up for it, including any a wake-up rescheduled for itself
+under a new job ID, is then a harmless no-op. `CronDelete` what `CronList`
+shows for it if you want the transcript quiet, but the ID from the original
+confirmation may be stale. Deleting only the cron job does not cancel
+anything: the entry still fires at the next turn end after its due time.
 
 ## How the queue fires
 
