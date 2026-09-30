@@ -66,7 +66,7 @@ queued prompt:
 > wait out the remaining seconds (a Bash `sleep`, or a Monitor until-loop on
 > `date +%s`). If you cannot wait, CronCreate this same prompt again
 > (`recurring: false`) at the expression printed by
-> `T=$(( ($(date +%s)/60+1)*60 )); case $(date -r $T +%M) in 00|30) T=$((T+60));; esac; date -r $T '+%M %H %d %m' | awk '{print $1+0,$2+0,$3+0,$4+0,"*"}'`.
+> `DUE=<epoch>; N=$(date +%s); T=$(( ((N+60>DUE?N+60:DUE)+59)/60*60 )); case $(date -r $T +%M) in 00|30) T=$((T+60));; esac; date -r $T '+%M %H %d %m' | awk '{print $1+0,$2+0,$3+0,$4+0,"*"}'`.
 > Then end the turn with one short line. The Stop hook delivers the queued
 > prompt.
 
@@ -74,7 +74,9 @@ The wake-up carries no work of its own, so it is harmless if the entry has
 already fired (the session ended a turn after the due time) or was cancelled.
 
 Confirm in one line: the due time (clock time, not just the delay), a few
-words of the prompt, and the cron job ID (`CronDelete` needs it to cancel).
+words of the prompt, and the cron job ID (only for tidying the wake-up out of
+`CronList` later; cancelling is done in the queue, see "Inspecting what's
+pending").
 
 If `CronCreate` isn't available in this session, queue the entry anyway and
 say plainly that it fires at the first turn end after the due time, not on
