@@ -47,10 +47,9 @@ command -v jq >/dev/null 2>&1 && ok "jq present" || { bad "jq present" "install 
 [ -f "$HOOK" ] && ok "hook script found" || { bad "hook script found" "$HOOK"; exit 1; }
 bash -n "$HOOK" && ok "hook parses" || bad "hook parses"
 bash -n "$SRC/install.sh" && ok "installer parses" || bad "installer parses"
-# `sleep` in command position only: the wake-up prompt the hook emits mentions
-# the word, and that is text, not a call. (No `(^|...)` group: BSD grep
-# matches `^` inside a group anywhere on the line.)
-grep -qE '^[^#]*([;&|(]|\$\(|\bthen|\bdo|\belse) *sleep\b|^ *sleep\b' "$HOOK" && bad "hook contains no sleep" "a blocking sleep freezes the session" \
+# The one line allowed to mention the word is the wake-up prompt text (WAKE=),
+# which tells the *agent* it may sleep; everything else is checked broadly.
+grep -vE '^[[:space:]]*WAKE=' "$HOOK" | grep -qE '^[^#]*\bsleep\b' && bad "hook contains no sleep" "a blocking sleep freezes the session" \
   || ok "hook contains no sleep"
 
 # ------------------------------------------------------------------- hook
