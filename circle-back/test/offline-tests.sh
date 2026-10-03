@@ -47,7 +47,10 @@ command -v jq >/dev/null 2>&1 && ok "jq present" || { bad "jq present" "install 
 [ -f "$HOOK" ] && ok "hook script found" || { bad "hook script found" "$HOOK"; exit 1; }
 bash -n "$HOOK" && ok "hook parses" || bad "hook parses"
 bash -n "$SRC/install.sh" && ok "installer parses" || bad "installer parses"
-grep -qE '^[^#]*\bsleep\b' "$HOOK" && bad "hook contains no sleep" "a blocking sleep freezes the session" \
+# `sleep` in command position only: the wake-up prompt the hook emits mentions
+# the word, and that is text, not a call. (No `(^|...)` group: BSD grep
+# matches `^` inside a group anywhere on the line.)
+grep -qE '^[^#]*([;&|(]|\$\(|\bthen|\bdo|\belse) *sleep\b|^ *sleep\b' "$HOOK" && bad "hook contains no sleep" "a blocking sleep freezes the session" \
   || ok "hook contains no sleep"
 
 # ------------------------------------------------------------------- hook
@@ -176,6 +179,83 @@ assert_eq "stack: second timer not due, its after waits" "" "$(fire "$Q" "$(as "
 sed -i.bak "1s/^[0-9]*/$PAST/" "$Q"; rm -f "$Q.bak"
 assert_eq "stack 3/4: second timer" "T2" "$(fire "$Q" "$(as "$SID")" | reason_of)"
 assert_eq "stack 4/4: its after" "A2" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
+
+head_ "6e. 'after <seconds>': the timer starts when the task ahead finishes"
+Q="$WORK/afterdelay.queue"
+SID=44444444-aaaa-bbbb-cccc-000000000004
+register "$SID" $$
+wake_of() { jq -r '.reason // empty' | grep -o 'circle-back wake-up for the entry due at [0-9:]* (epoch [0-9]*): "[^"]*"' ; }
+# Alone: the current turn ending starts the clock. The entry becomes a timed
+# one due <delay> from now and the next turn is its wake-up turn.
+printf 'after+120:%s\t%s\tRUN PROMPT X with more words than six\n' "$(NOW)" "$SID" > "$Q"
+T0=$(NOW); OUT=$(fire "$Q" "$(as "$SID")"); T1=$(NOW)
+WAKE=$(wake_of <<<"$OUT")
+case "$WAKE" in
+  *'(epoch '*'): "RUN PROMPT X with more words..."') ok "blocks with the wake-up prompt" ;;
+  *) bad "blocks with the wake-up prompt" "$OUT" ;;
+esac
+DUE_NOW=$(cut -f1 "$Q")
+[ "$DUE_NOW" -ge $((T0+120)) ] 2>/dev/null && [ "$DUE_NOW" -le $((T1+120)) ] \
+  && ok "entry rewritten as timed, due 120s from this Stop" \
+  || bad "entry rewritten as timed, due 120s from this Stop" "$(cat "$Q")"
+assert_eq "wake-up names the same due epoch" "$DUE_NOW" "$(sed 's/.*(epoch \([0-9]*\)).*/\1/' <<<"$WAKE")"
+assert_eq "rewritten entry keeps its prompt" "RUN PROMPT X with more words than six" "$(cut -f3 "$Q")"
+assert_eq "rewritten entry is tagged to the firing session" "$SID" "$(cut -f2 "$Q")"
+assert_eq "one line in the queue, not two" "1" "$(grep -c . "$Q")"
+CRON=$(jq -r '.reason' <<<"$OUT" | grep -o 'recurring: false`) at `[^`]*`' | sed 's/.*at `//; s/`$//')
+case "$CRON" in
+  [0-9]*' '[0-9]*' '[0-9]*' '[0-9]*' *') ok "wake-up carries a cron expression ($CRON)" ;;
+  *) bad "wake-up carries a cron expression" "$CRON" ;;
+esac
+case "${CRON%% *}" in 0|30) bad "cron minute avoids :00/:30" "$CRON" ;; *) ok "cron minute avoids :00/:30" ;; esac
+CRON_MIN=${CRON%% *}; DUE_MIN=$(( (DUE_NOW + 59) / 60 * 60 ))
+case "$CRON_MIN" in
+  $(( DUE_MIN / 60 % 60 ))|$(( (DUE_MIN + 60) / 60 % 60 ))) ok "cron minute is the due time rounded up" ;;
+  *) bad "cron minute is the due time rounded up" "due $DUE_NOW -> $CRON" ;;
+esac
+case "$(jq -r '.systemMessage' <<<"$OUT")" in *"timer started"*) ok "user told the timer started" ;; *) bad "user told the timer started" "$OUT" ;; esac
+assert_eq "wake-up turn ending early fires nothing" "" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+sed -i.bak "1s/^[0-9]*/$PAST/" "$Q"; rm -f "$Q.bak"            # the delay elapses
+assert_eq "once due, the prompt fires" "RUN PROMPT X with more words than six" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+assert_eq "drained" "0" "$(grep -c . "$Q" 2>/dev/null | head -1)"
+# Behind a pending timed entry: the clock does not start until that one has run.
+printf '%s\t%s\tthe timed one\nafter+60:%s\t%s\ttwo minutes after it\n' "$(future 3600)" "$SID" "$(NOW)" "$SID" > "$Q"
+assert_eq "blocked by a pending entry ahead: nothing" "" "$(fire "$Q" "$(as "$SID")")"
+assert_eq "not converted while blocked" "after+60" "$(cut -f1 "$Q" | sed -n '2s/:.*//p')"
+sed -i.bak "1s/^[0-9]*/$PAST/" "$Q"; rm -f "$Q.bak"
+assert_eq "the timed one fires first" "the timed one" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+T0=$(NOW); OUT=$(fire "$Q" "$(as "$SID")")
+[ -n "$(wake_of <<<"$OUT")" ] && ok "its turn ending starts the timer (wake-up turn)" || bad "its turn ending starts the timer" "$OUT"
+[ "$(cut -f1 "$Q")" -ge $((T0+60)) ] 2>/dev/null && ok "due = end of the task ahead + 60s" || bad "due = end of the task ahead + 60s" "$(cat "$Q")"
+# Chain: after+N then a plain after. The plain one waits through the wake-up
+# turn and the timed fire, then goes.
+printf 'after+60:%s\t%s\tA\nafter:%s\t%s\tB\n' "$(NOW)" "$SID" "$(NOW)" "$SID" > "$Q"
+[ -n "$(fire "$Q" "$(as "$SID")" | wake_of)" ] && ok "chain: A's timer starts" || bad "chain: A's timer starts"
+assert_eq "chain: B waits while A is pending" "" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+sed -i.bak "1s/^[0-9]*/$PAST/" "$Q"; rm -f "$Q.bak"
+assert_eq "chain: A fires when due" "A" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+assert_eq "chain: B fires at the next Stop" "B" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+# The wake-up turn goes before a due entry queued behind it, like a plain after;
+# that entry fires when the wake-up turn ends.
+printf 'after+60:%s\t%s\tA\n%s\t%s\tdue, queued later\n' "$(NOW)" "$SID" "$PAST" "$SID" > "$Q"
+[ -n "$(fire "$Q" "$(as "$SID")" | wake_of)" ] && ok "wake-up turn precedes a later due entry" || bad "wake-up turn precedes a later due entry"
+assert_eq "the later due entry fires at the next Stop" "due, queued later" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+assert_eq "A still pending" "A" "$(cut -f3 "$Q")"
+# after+0 is a plain after.
+printf 'after+0:%s\t%s\tno delay\n' "$(NOW)" "$SID" > "$Q"
+assert_eq "after+0 fires like a plain after" "no delay" "$(fire "$Q" "$(as "$SID")" | reason_of)"
+# Another session's after+N is neither converted nor fired while its owner lives.
+register "$THEIRS" $$
+printf 'after+60:%s\t%s\ttheirs\n' "$(NOW)" "$THEIRS" > "$Q"
+assert_eq "a live session's after+N entry is left alone" "" "$(fire "$Q" "$(as "$SID")")"
+assert_eq "...and not converted" "after+60" "$(cut -f1 "$Q" | sed 's/:.*//')"
+rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
+# Shell-hostile prompt survives the rewrite.
+register "$SID" $$
+printf 'after+60:%s\t%s\tfix the "auth" bug; echo $HOME `whoami` \\n not a newline\n' "$(NOW)" "$SID" > "$Q"
+fire "$Q" "$(as "$SID")" >/dev/null
+assert_eq "rewrite preserves metacharacters" 'fix the "auth" bug; echo $HOME `whoami` \n not a newline' "$(cut -f3 "$Q")"
 rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
 
 head_ "7. malformed due time fires immediately"

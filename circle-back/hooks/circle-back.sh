@@ -15,6 +15,9 @@
 # Queue file format, one entry per line:
 #   <due_epoch_seconds><TAB><session_id><TAB><prompt>   (current)
 #   after:<queued_epoch><TAB><session_id><TAB><prompt>  (fires after the task ahead of it)
+#   after+<delay>:<queued_epoch><TAB><session_id><TAB><prompt>
+#                                                       (timer of <delay> seconds that starts
+#                                                        when the task ahead of it finishes)
 #   <due_epoch_seconds><TAB><prompt>                    (legacy, untagged)
 #
 # An `after` entry has no due time. It waits for every entry ahead of it in
@@ -24,6 +27,15 @@
 # epoch after the colon is when it was queued; it only matters for adopting an
 # orphan when the owner's liveness is unknown (a bare `after` is also accepted,
 # and is then never adopted).
+#
+# An `after+<delay>` entry is an `after` entry whose timer has not started
+# yet. The moment it would otherwise fire, the hook instead rewrites it in
+# place as a timed entry due <delay> seconds from now and blocks with the
+# wake-up prompt for it (the same prompt the skill gives CronCreate), so the
+# agent's next turn is the wake-up: it waits out the delay or schedules a cron
+# wake-up, ends the turn, and the entry fires like any other timed one. The
+# wake-up turn goes before anything queued behind the entry, as a plain
+# `after` would.
 #
 # A timed entry's clock is the built-in CronCreate scheduler: the skill also
 # schedules a one-shot wake-up prompt at the due minute, whose only job is to
@@ -62,6 +74,9 @@ SESSIONS_DIR="${CIRCLE_BACK_SESSIONS_DIR:-$HOME/.claude/sessions}"
 ADOPT_AFTER="${CIRCLE_BACK_ADOPT_AFTER:-3600}"
 case "$ADOPT_AFTER" in ''|*[!0-9]*) ADOPT_AFTER=3600 ;; esac
 NOW=$(date +%s)
+
+# Format an epoch: BSD `date -r`, else GNU `date -d @`.
+fmt_date() { date -r "$1" "$2" 2>/dev/null || date -d "@$1" "$2"; }
 
 UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 
@@ -137,22 +152,32 @@ eligible() {
 # session may fire, and once unblocked counts as due since forever (due 0), so
 # it goes before anything queued behind it.
 scan() {
-  local LINE DUE AFTER REF AHEAD=0
-  TARGET=0; BEST=0; DUE_N=0; N=0
+  local LINE DUE AFTER REF DELAY AHEAD=0
+  TARGET=0; BEST=0; DUE_N=0; N=0; CONVERT=0; CONV_DELAY=0
   while IFS= read -r LINE || [ -n "$LINE" ]; do
     N=$((N+1))
     [ -n "$LINE" ] || continue
     DUE=${LINE%%$'\t'*}
-    AFTER=0
+    AFTER=0; DELAY=0
     case "$DUE" in
-      after|after:*) AFTER=1; REF=${DUE#after}; REF=${REF#:}; DUE=0
-                     case "$REF" in *[!0-9]*) REF= ;; esac ;;
+      after|after:*|after+*)
+        AFTER=1; REF=${DUE#after}; DUE=0
+        case "$REF" in
+          +*) DELAY=${REF#+}; DELAY=${DELAY%%:*}
+              case "$REF" in *:*) REF=${REF#*:} ;; *) REF= ;; esac   # ":<queued>" is optional
+              case "$DELAY" in ''|*[!0-9]*) DELAY=0 ;; esac ;;
+        esac
+        REF=${REF#:}
+        case "$REF" in *[!0-9]*) REF= ;; esac ;;
       ''|*[!0-9]*) DUE=0; REF=0 ;;              # malformed -> due immediately
       *) REF=$DUE ;;
     esac
     eligible "$LINE" "$REF" || continue          # another session's entry: leave it
     if [ "$AFTER" = 1 ] && [ "$AHEAD" = 1 ]; then continue; fi  # waits for what is ahead
     AHEAD=1
+    # An after+<delay> entry that just came unblocked: its timer starts now.
+    # Not due yet -- it is rewritten as a timed entry below, after the scan.
+    if [ "$AFTER" = 1 ] && [ "$DELAY" -gt 0 ]; then CONVERT=$N; CONV_DELAY=$DELAY; continue; fi
     [ "$DUE" -le "$NOW" ] || continue
     DUE_N=$((DUE_N+1))
     if [ "$TARGET" -eq 0 ] || [ "$DUE" -lt "$BEST" ]; then TARGET=$N; BEST=$DUE; fi
@@ -188,12 +213,48 @@ elif command -v perl >/dev/null 2>&1; then
 else
   # Count only entries this session would fire; others aren't its to report.
   scan
+  [ "$CONVERT" -gt 0 ] && DUE_N=$((DUE_N+1))   # its timer can't start without the lock either
   [ "$DUE_N" -gt 0 ] && jq -n --arg n "$DUE_N" --arg q "$QUEUE" \
     '{systemMessage:("circle-back: " + $n + " due entr(y/ies) not fired -- needs flock or perl to lock " + $q)}'
   exit 0
 fi
 
 scan
+
+# An after+<delay> entry came unblocked at this Stop: start its timer. Rewrite
+# it in place as a timed entry due <delay> seconds from now, tagged to this
+# session (it owns the wake-up from here on), and make the next turn the
+# wake-up turn by blocking with the same wake-up prompt the skill hands to
+# CronCreate. This goes before any other due entry, as a plain `after` would;
+# that entry fires at the end of the wake-up turn.
+if [ "$CONVERT" -gt 0 ]; then
+  ENTRY=$(sed -n "${CONVERT}p" "$QUEUE")
+  TAG=$(entry_sid "$ENTRY")
+  PROMPT=${ENTRY#*$'\t'}
+  [ -z "$TAG" ] || PROMPT=${PROMPT#*$'\t'}
+  [ -n "$SID" ] && TAG=$SID
+  DUE=$(( NOW + CONV_DELAY ))
+  TMP=$(mktemp) && {
+    [ "$CONVERT" -le 1 ] || head -n $((CONVERT-1)) "$QUEUE"
+    if [ -n "$TAG" ]; then printf '%s\t%s\t%s\n' "$DUE" "$TAG" "$PROMPT"
+    else printf '%s\t%s\n' "$DUE" "$PROMPT"; fi
+    tail -n +$((CONVERT+1)) "$QUEUE"
+  } > "$TMP" && mv "$TMP" "$QUEUE"
+  # Wake-up minute: the due time rounded up to a whole minute, at least a
+  # minute out (the agent needs time to schedule it), and never :00 or :30,
+  # where one-shots can arrive up to 90 s early.
+  T=$(( NOW + 60 )); [ "$T" -ge "$DUE" ] || T=$DUE
+  T=$(( (T + 59) / 60 * 60 ))
+  case "$(fmt_date "$T" +%M)" in 00|30) T=$(( T + 60 )) ;; esac
+  CRON=$(fmt_date "$T" '+%M %H %d %m' | awk '{print $1+0, $2+0, $3+0, $4+0, "*"}')
+  FEW=$(printf '%s' "$PROMPT" | awk '{n=(NF>6?6:NF); s=$1; for(i=2;i<=n;i++) s=s" "$i; if(NF>6) s=s"..."; print s}')
+  WAKE="circle-back wake-up for the entry due at $(fmt_date "$DUE" +%H:%M:%S) (epoch $DUE): \"$FEW\". Its ${CONV_DELAY}s timer started just now, when the work ahead of it finished. Do nothing else this turn. If \`date +%s\` is still before $DUE, wait out the remaining seconds (a Bash \`sleep\`, or a Monitor until-loop on \`date +%s\`). If you cannot wait, CronCreate this same prompt (\`recurring: false\`) at \`$CRON\`, or once that minute has passed, at the expression printed by \`N=\$(date +%s); T=\$(( ((N+60>$DUE?N+60:$DUE)+59)/60*60 )); case \$(date -r \$T +%M) in 00|30) T=\$((T+60));; esac; date -r \$T '+%M %H %d %m' | awk '{print \$1+0,\$2+0,\$3+0,\$4+0,\"*\"}'\`. Then end the turn with one short line. The Stop hook delivers the queued prompt."
+  REMAINING=$(grep -c . "$QUEUE" 2>/dev/null || true)
+  [ -n "$REMAINING" ] || REMAINING=0
+  jq -n --arg p "$WAKE" --arg t "$(fmt_date "$DUE" +%H:%M:%S)" --arg n "$REMAINING" \
+    '{decision:"block", reason:$p, systemMessage:("circle-back: timer started, entry due at " + $t + "; " + $n + " in queue")}'
+  exit 0
+fi
 
 # Nothing due yet: end the turn normally. This is the common case and is what
 # keeps the session interactive while long entries are pending.

@@ -1,14 +1,14 @@
 ---
 name: circle-back
-argument-hint: <seconds|after> <prompt>
-description: Queue a follow-up prompt to be sent automatically once a delay has elapsed or once the previous task completes, without interrupting work in progress. Use this whenever the user says "circle around", "circle back", "queue this for later", "come back to this in X minutes", "after this is done, also...", "then do X" (right after queuing something else), or otherwise wants a prompt held and fired later rather than acted on now — including when the queued prompt is unrelated to whatever is currently in flight.
+argument-hint: <seconds|after [seconds]> <prompt>
+description: Queue a follow-up prompt to be sent automatically once a delay has elapsed or once the previous task completes, without interrupting work in progress. Use this whenever the user says "circle around", "circle back", "queue this for later", "come back to this in X minutes", "after this is done, also...", "then do X" (right after queuing something else), or otherwise wants a prompt held and fired later rather than acted on now — including when the queued prompt is unrelated to whatever is currently in flight. Also covers "X minutes after this finishes" (`after <seconds>`), where the timer starts when the current work ends rather than now.
 ---
 
 # circle-back
 
 Hold a prompt and send it later. Every entry lives in one queue file, in the
 order it should run, and the `circle-back.sh` Stop hook fires the next due
-entry when a turn ends. There are two ways an entry comes due:
+entry when a turn ends. There are three ways an entry comes due:
 
 - **A clock (`<seconds>`).** The entry carries an absolute due time. Because
   the hook only runs when a turn *ends*, a session sitting idle at the prompt
@@ -22,6 +22,13 @@ entry when a turn ends. There are two ways an entry comes due:
   waits for every entry ahead of it in the queue, timed or not, and fires at
   the end of the turn in which the last of them ran. With nothing ahead of it,
   that is the end of the work in flight right now.
+- **A clock that starts when the previous task finishes (`after <seconds>`).**
+  An `after` entry carrying a delay. It waits like a plain `after`, and at the
+  moment it would have fired, the hook starts its timer instead: the entry
+  becomes a timed one due `<seconds>` from then, and the hook hands the agent
+  the wake-up prompt for it as the next turn. `/circle-back after 120 run the
+  smoke test` runs the smoke test two minutes after the current work ends,
+  however long that takes.
 
 Because timers and `after` entries share one queue, they stack: a timer with a
 command, then an `after` behind it, runs the timer's prompt at its due time and
@@ -32,7 +39,11 @@ the `after` prompt when that turn ends.
 Invocation looks like `/circle-back <seconds> <prompt>`. Claude Code hands the
 arguments to you as a trailing `ARGUMENTS: <seconds|after> <prompt>` line.
 The first token is either the delay in seconds or the word `after`; everything
-after it is the prompt, verbatim.
+after it is the prompt, verbatim. One exception: when the first token is
+`after` and the second is a bare integer, that integer is a delay in seconds
+that starts when the task ahead finishes (see "`after <seconds>`" below), and
+the prompt is everything after it. A prompt that genuinely starts with a
+number goes behind `after 0`, which is a plain `after`.
 
 ### Delay greater than 0: queue entry plus a cron wake-up
 
@@ -115,6 +126,31 @@ what's pending", filtered to this session) and say so: "fires after 'check the
 deploy' (due 11:00)" or "fires when the current work ends". The user may have
 meant the other one.
 
+### `after <seconds>`: a timer that starts when the task ahead finishes
+
+```bash
+Q="${CIRCLE_BACK_QUEUE:-$HOME/.claude/circle-back/$(printf '%s' "$PWD" | shasum -a 256 | cut -c1-12).queue}"
+mkdir -p "$(dirname "$Q")"
+printf 'after+%s:%s\t%s\t%s\n' "$SECONDS_ARG" "$(date +%s)" "${CLAUDE_CODE_SESSION_ID:?no session id}" "$PROMPT_ARG" >> "$Q"
+```
+
+The first field is `after+<seconds>` plus the time it was queued. No cron
+wake-up is scheduled now: there is nothing to schedule it for, since the due
+time is not known until the task ahead ends. The entry waits exactly like a
+plain `after`. At the Stop where a plain `after` would fire, the hook instead
+rewrites this entry in place as a timed entry due `<seconds>` from that
+moment and blocks with the wake-up prompt for it, so the very next turn is
+the wake-up turn: the agent waits out the delay (or `CronCreate`s a wake-up
+at the minute the prompt names, if the wait is long), ends the turn, and the
+entry fires. From then on it is an ordinary timed entry, and cancelling it is
+dropping its queue line, as usual.
+
+Confirm in one line: the delay, that it starts when the work ahead ends, what
+that work is (as for `after`), and a few words of the prompt: "fires 2 min
+after the current work ends: 'run the smoke test'" or "fires 10 min after
+'check the deploy' (due 11:00) has run". Beyond a few hours, prefer a plain
+timed entry or the `schedule` skill: the wake-up turn needs the session open.
+
 ### Delay 0: due now, ahead of anything pending
 
 A `0` delay is a timed entry with the current time as its due time and no
@@ -154,7 +190,12 @@ Scheduling is the whole job.
 - **An `after` entry waits for everything ahead of it in the queue,** even an
   entry due hours from now. Say what it is waiting on when you confirm.
 - **The wake-up is a visible turn.** It shows in the transcript as a prompt
-  and a one-line reply before the queued prompt runs.
+  and a one-line reply before the queued prompt runs. For `after <seconds>`
+  there is no cron job at all until that turn: the hook delivers the wake-up
+  prompt directly as "Stop hook feedback" the moment the timer starts, and
+  the agent sleeps or schedules a cron wake-up from there. Like a plain
+  `after`, that turn goes before anything queued behind the entry; a timed
+  entry behind it that is already due fires when the wake-up turn ends.
 
 ## Rules
 
@@ -171,6 +212,10 @@ Scheduling is the whole job.
   rather than asking.
 - If the user gives no delay, use `after`. It goes in the queue and fires when
   the previous task completes.
+- If the user gives a delay *and* ties it to the current work finishing ("two
+  minutes after this is done", "once that lands, wait 5 min then..."), use
+  `after <seconds>`. A bare delay is measured from now; `after <seconds>` is
+  measured from the end of the task ahead.
 - Beyond a few hours, prefer the `schedule` skill. The queue and its wake-up
   both need the session to still be open.
 
@@ -184,6 +229,7 @@ entry shows its prompt in the session column):
 ```bash
 while IFS=$'\t' read -r due sid prompt; do
   case "$due" in
+    after+*) d=${due#after+}; printf '%ss after the task ahead  [%s]  %s\n' "${d%%:*}" "${sid:0:8}" "$prompt" ;;
     after*) printf 'after the task ahead    [%s]  %s\n' "${sid:0:8}" "$prompt" ;;
     *) printf '%s  (in %ss)  [%s]  %s\n' "$(date -r "$due" '+%H:%M:%S')" "$(( due - $(date +%s) ))" "${sid:0:8}" "$prompt" ;;
   esac
@@ -220,7 +266,12 @@ delivered alongside it, not instead of it.
 
 An `after` entry has no due time. It is skipped while any entry ahead of it in
 the file is one this session may fire; once none is left it counts as due, and
-fires at that Stop. Since each fire removes one line and the fired prompt runs
+fires at that Stop. An `after+<seconds>` entry is skipped the same way, but
+once unblocked it is not fired: the hook rewrites it as a timed entry due
+`<seconds>` from that Stop, retagged to the session that did the rewrite, and
+blocks with its wake-up prompt instead (the same text the skill gives
+`CronCreate`, with the due epoch and cron expression filled in). The timed
+entry then fires at the first Stop after its due time, like any other. Since each fire removes one line and the fired prompt runs
 in the next turn, "the entry ahead of it is gone" and "the previous task's
 turn has ended" are the same moment. When the registry can't say whether an
 `after` entry's owner is still running, the hour-overdue fallback measures
