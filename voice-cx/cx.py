@@ -11,12 +11,16 @@ the loop owns, kept in the consuming repo's data dir:
     ships.jsonl      a fix for a cluster went live (commit/ref)
     scorecard.jsonl  one line per recorded scorecard
 
-Nothing is ever rewritten: a re-judgment appends and the newest line for an
-episode wins, so the history of how the judge changed its mind survives.
+Nothing is ever rewritten. A re-judgment appends, and the newest line for an
+(episode, cluster) pair wins, so one episode can hold several problems and the
+history of how the judge changed its mind survives. To take a judgment back
+(a misspelled or wrong cluster), append a retraction:
+`judge EP --cluster X --retract`.
 
     cx.py --config voice/cx.json episodes [--days 7] [--all] [--json]
     cx.py --config voice/cx.json judge EP [EP ...] --verdict bad --stage routing \\
           --severity S2 --wanted "WFPK playing" --cluster radio-word-order [--fix template]
+    cx.py --config voice/cx.json judge EP --cluster wrong-slug --retract
     cx.py --config voice/cx.json flag --note "the radio kept playing YouTube" [--at ISO]
     cx.py --config voice/cx.json ship CLUSTER --ref abc123 [--note ...]
     cx.py --config voice/cx.json queue
@@ -152,6 +156,21 @@ def _ts(value: str) -> datetime:
     return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
 
 
+def iso_utc(value: str) -> str:
+    """A user-supplied time, validated and normalized to UTC (or a clean exit).
+
+    Everything the loop stores is compared as a moment, never as a string, but
+    an unparseable value in an append-only file would break every later run, so
+    it is refused at the door (roborev #5470).
+    """
+    try:
+        return _ts(value).astimezone(UTC).isoformat(timespec="seconds")
+    except ValueError:
+        raise SystemExit(
+            f"--at must be an ISO 8601 time, e.g. 2026-10-06T01:30:00+00:00 (got {value!r})"
+        ) from None
+
+
 def _words(text: str) -> list[str]:
     return re.findall(r"[a-z0-9%']+", (text or "").lower())
 
@@ -228,8 +247,10 @@ def attach_flags(
 ) -> list[dict[str, Any]]:
     """Point each flag at the episode holding the latest turn before it. Returns orphans.
 
-    A voice flag names "that": the last thing that happened. A chat/dashboard
-    flag may carry an explicit `episode`, or an `at` time to anchor on.
+    A voice flag names "that": the last thing that happened ON THE DEVICE IT
+    WAS SPOKEN TO, so a flag with a `device` only looks at that device's turns.
+    A chat/dashboard flag (no device) may carry an explicit `episode`, or an
+    `at` time to anchor on, and looks at every device.
     """
     lookback = timedelta(seconds=cfg["flag_lookback_seconds"])
     by_id = {e.id: e for e in episodes}
@@ -241,6 +262,8 @@ def attach_flags(
         anchor = _ts(f.get("at") or f["ts"])
         best: tuple[datetime, Episode] | None = None
         for e in episodes:
+            if f.get("device") and e.device != f["device"]:
+                continue
             for t in e.turns:
                 moment = _ts(t["ts"])
                 if moment <= anchor and anchor - moment <= lookback:
@@ -295,14 +318,22 @@ def detect_signals(e: Episode, cfg: dict[str, Any]) -> None:
 
 
 def episodes_for(cfg: dict[str, Any], root: Path, days: int | None) -> tuple[list[Episode], list]:
+    """Episodes (and unattached flags) whose activity reaches into the window.
+
+    Episodes are built from ALL turns and then filtered, so an episode keeps
+    the same id however wide the window is (roborev #5470): one straddling the
+    cutoff is shown whole, under its real first turn.
+    """
     turns = read_jsonl(root / cfg["turns"])
-    if days is not None:
-        since = datetime.now(UTC) - timedelta(days=days)
-        turns = [t for t in turns if _ts(t["ts"]) >= since]
     requests, voice_flags = split_flags(turns, cfg["flag_pattern"])
     episodes = build_episodes(requests, cfg)
-    chat_flags = read_jsonl(root / cfg["data_dir"] / "flags.jsonl")
-    orphans = attach_flags(episodes, voice_flags + chat_flags, cfg)
+    flags = voice_flags + read_jsonl(root / cfg["data_dir"] / "flags.jsonl")
+    orphans = attach_flags(episodes, flags, cfg)
+    if days is not None:
+        since = datetime.now(UTC) - timedelta(days=days)
+        episodes = [e for e in episodes if _ts(e.end) >= since]
+        # Old orphans are history, not news: report only those in the window.
+        orphans = [f for f in orphans if _ts(f.get("at") or f["ts"]) >= since]
     for e in episodes:
         detect_signals(e, cfg)
     return episodes, orphans
@@ -315,11 +346,16 @@ RANK = {"bad": 3, "friction": 2, "good": 1, "skip": 0}
 
 
 def latest_judgments(root: Path, cfg: dict[str, Any]) -> list[dict[str, Any]]:
-    """The newest judgment per (episode, cluster): one episode can hold several problems."""
+    """The newest judgment per (episode, cluster), minus retracted ones.
+
+    One episode can hold several problems, so the key is the pair. A
+    retraction (`judge EP --cluster X --retract`) is a newer line that removes
+    the pair: a misfiled cluster stops counting without rewriting history.
+    """
     out: dict[tuple[str, str], dict[str, Any]] = {}
     for j in read_jsonl(root / cfg["data_dir"] / "judgments.jsonl"):
         out[(j["episode"], j.get("cluster") or "")] = j
-    return list(out.values())
+    return [j for j in out.values() if not j.get("retracted")]
 
 
 def episode_verdicts(judgments: list[dict[str, Any]]) -> dict[str, str]:
@@ -390,9 +426,10 @@ def cmd_episodes(cfg, root, args) -> int:
             # A reply that contradicts the effects carries no signal unless the
             # adapter proved it, so the effects must be on screen to be judged:
             # "Pause." -> "Nothing is playing." while the radio stopped, 2026-10-06.
-            for u in e.turns:
+            for i, u in enumerate(e.turns, 1):
                 if u.get("effects"):
-                    print(f"      effects: {u['effects']}")
+                    heard = u.get("heard")
+                    print(f"      {i}. {u['ts'][11:19]} {heard!r}: effects: {u['effects']}")
     for f in orphans:
         print(
             f"\nORPHAN FLAG {f['ts'][:19]}: {f.get('reason') or f.get('note')!r} (no turn to attach to)"
@@ -401,6 +438,10 @@ def cmd_episodes(cfg, root, args) -> int:
 
 
 def cmd_judge(cfg, root, args) -> int:
+    if args.retract:
+        return retract(cfg, root, args)
+    if not args.verdict:
+        raise SystemExit("--verdict is required (or --retract with --cluster)")
     if args.verdict in ("friction", "bad") and not (args.severity and args.stage and args.cluster):
         raise SystemExit("friction/bad needs --severity, --stage and --cluster")
     episodes, _ = episodes_for(cfg, root, None)
@@ -435,6 +476,29 @@ def cmd_judge(cfg, root, args) -> int:
     return 0
 
 
+def retract(cfg, root, args) -> int:
+    if args.cluster is None:
+        raise SystemExit("--retract needs --cluster (use '' for a judgment filed without one)")
+    judged = {(j["episode"], j.get("cluster") or "") for j in latest_judgments(root, cfg)}
+    for ep in args.episode:
+        if (ep, args.cluster) not in judged:
+            raise SystemExit(f"no current judgment of {ep} under cluster {args.cluster!r}")
+    for ep in args.episode:
+        append_jsonl(
+            root / cfg["data_dir"] / "judgments.jsonl",
+            {
+                "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+                "episode": ep,
+                "cluster": args.cluster or None,
+                "retracted": True,
+                "why": args.why,
+                "judge": args.judge,
+            },
+        )
+    print(f"retracted {len(args.episode)} judgment(s) under {args.cluster!r}")
+    return 0
+
+
 def cmd_flag(cfg, root, args) -> int:
     record = {
         "ts": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -442,7 +506,7 @@ def cmd_flag(cfg, root, args) -> int:
         "note": args.note,
     }
     if args.at:
-        record["at"] = args.at
+        record["at"] = iso_utc(args.at)
     if args.episode:
         record["episode"] = args.episode
     append_jsonl(root / cfg["data_dir"] / "flags.jsonl", record)
@@ -454,7 +518,7 @@ def cmd_ship(cfg, root, args) -> int:
     append_jsonl(
         root / cfg["data_dir"] / "ships.jsonl",
         {
-            "ts": args.at or datetime.now(UTC).isoformat(timespec="seconds"),
+            "ts": iso_utc(args.at) if args.at else datetime.now(UTC).isoformat(timespec="seconds"),
             "cluster": args.cluster,
             "ref": args.ref,
             "note": args.note,
@@ -493,9 +557,13 @@ def clusters(root: Path, cfg: dict[str, Any]) -> list[dict[str, Any]]:
         if j.get("fix"):
             c["fixes"][j["fix"]] += 1
     for name, c in out.items():
-        last_ship = max((s["ts"] for s in ships.get(name, [])), default=None)
+        last_ship = max((s["ts"] for s in ships.get(name, [])), key=_ts, default=None)
         # Episodes judged against the pre-fix system count toward priority only until a fix ships.
-        live = [j for j in c["episodes"] if last_ship is None or j["episode_start"] > last_ship]
+        live = [
+            j
+            for j in c["episodes"]
+            if last_ship is None or _ts(j["episode_start"]) > _ts(last_ship)
+        ]
         bad = [j for j in live if j["verdict"] in ("bad", "friction")]
         good = [j for j in live if j["verdict"] == "good"]
         if last_ship is None:
@@ -608,7 +676,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("judge", help="record a verdict for one or more episodes")
     p.add_argument("episode", nargs="+")
-    p.add_argument("--verdict", required=True, choices=VERDICTS)
+    p.add_argument("--verdict", choices=VERDICTS)
     p.add_argument("--severity", choices=sorted(SEVERITY))
     p.add_argument("--stage", choices=STAGES)
     p.add_argument("--cluster", help="kebab-case root-cause slug, shared across episodes")
@@ -620,6 +688,11 @@ def main(argv: list[str] | None = None) -> int:
         "--not-voiced",
         action="store_true",
         help="the episode's flag/user words were about a different problem than this cluster",
+    )
+    p.add_argument(
+        "--retract",
+        action="store_true",
+        help="withdraw the current judgment of these episodes under --cluster",
     )
 
     p = sub.add_parser("flag", help="record a user callout made outside the assistant")

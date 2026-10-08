@@ -87,6 +87,10 @@ CX judge EP --verdict bad --severity S1 --stage routing --cluster radio-call-sig
 CX judge EP1 EP2 EP3 --verdict good          # quiet episodes that read right
 ```
 
+Filed under the wrong cluster, or misspelled one? Take it back with
+`CX judge EP --cluster <wrong-slug> --retract`, then judge it again under the
+right one. The newest judgment per (episode, cluster) is the one that counts.
+
 Use `--verdict skip` only for episodes with no user in them (a false wake on
 room noise is NOT a skip — that is a wake-stage problem the user lived with).
 

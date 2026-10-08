@@ -56,7 +56,9 @@ Pick a phrase that nobody says by accident and that the recogniser hears
 reliably; the default is **"flag that"**, optionally followed by what went
 wrong ("flag that, I said WFPK"). Handle it on the device's *deterministic*
 path so it works even when the LLM is the problem, have it change nothing, and
-answer with a short acknowledgement ("Flagged."). The turn then appears in the
+answer with a short acknowledgement ("Flagged."). A voice flag attaches only
+to turns on the device it was spoken to; a flag with no `device` (chat,
+dashboard) looks at every device. The turn then appears in the
 turn log like any other; `cx.py` recognises it by `flag_pattern`, removes it
 from the episode, and attaches it (with the reason, read literally) to the last
 thing that happened before it.

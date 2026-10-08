@@ -158,6 +158,144 @@ class JudgmentTests(unittest.TestCase):
         self.assertFalse(cx.EXPERIENCE_LANGUAGE.search("play the radio station wfpk"))
 
 
+class ReviewFixTests(unittest.TestCase):
+    """roborev #5470 / #5474."""
+
+    def test_voice_flag_attaches_to_its_own_device(self):
+        cfg = dict(cx.DEFAULTS)
+        eps = cx.build_episodes(
+            [
+                turn(1, "01:00:00", "a", device="kitchen"),
+                turn(2, "01:00:10", "b", device="bedroom"),
+            ],
+            cfg,
+        )
+        flag = {"ts": "2026-10-06T01:00:20+00:00", "device": "kitchen", "reason": ""}
+        cx.attach_flags(eps, [flag], cfg)
+        kitchen = next(e for e in eps if e.device == "kitchen")
+        bedroom = next(e for e in eps if e.device == "bedroom")
+        self.assertEqual((len(kitchen.flags), len(bedroom.flags)), (1, 0))
+
+    def test_retract_withdraws_a_misfiled_cluster(self):
+        r = Repo([turn(1, "01:00:00", "play wfpk")])
+        try:
+            r.run(
+                "judge",
+                "t1",
+                "--verdict",
+                "bad",
+                "--severity",
+                "S1",
+                "--stage",
+                "routing",
+                "--cluster",
+                "radoi",
+            )
+            r.run(
+                "judge",
+                "t1",
+                "--verdict",
+                "bad",
+                "--severity",
+                "S1",
+                "--stage",
+                "routing",
+                "--cluster",
+                "radio",
+            )
+            r.run("judge", "t1", "--cluster", "radoi", "--retract")
+            names = [c["cluster"] for c in cx.clusters(*reversed(r.cfg()))]
+            self.assertEqual(names, ["radio"])
+            with self.assertRaises(SystemExit):
+                r.run("judge", "t1", "--cluster", "never-filed", "--retract")
+        finally:
+            r.dir.cleanup()
+
+    def test_unparseable_at_is_refused_and_nothing_is_written(self):
+        r = Repo([turn(1, "01:00:00", "a")])
+        try:
+            for argv in (
+                ("flag", "--note", "x", "--at", "yesterday 8pm"),
+                ("ship", "c", "--ref", "r", "--at", "20:15"),
+            ):
+                with self.assertRaises(SystemExit):
+                    r.run(*argv)
+            self.assertFalse((r.root / "cx" / "flags.jsonl").exists())
+            self.assertFalse((r.root / "cx" / "ships.jsonl").exists())
+        finally:
+            r.dir.cleanup()
+
+    def test_ship_times_compare_as_moments_not_strings(self):
+        # 22:00-04:00 is 02:00 UTC on the 7th, AFTER an episode at 01:00 UTC on the 7th.
+        r = Repo([{**turn(1, "01:00:00", "a"), "ts": "2026-10-07T01:00:00+00:00"}])
+        try:
+            r.run(
+                "judge",
+                "t1",
+                "--verdict",
+                "bad",
+                "--severity",
+                "S2",
+                "--stage",
+                "action",
+                "--cluster",
+                "c",
+            )
+            r.run("ship", "c", "--ref", "r", "--at", "2026-10-06T22:00:00-04:00")
+            (c,) = cx.clusters(*reversed(r.cfg()))
+            self.assertEqual(c["status"], "shipped")  # the episode is pre-ship: not a reopen
+            self.assertEqual(c["last_ship"], "2026-10-07T02:00:00+00:00")
+        finally:
+            r.dir.cleanup()
+
+    def test_episode_ids_do_not_depend_on_the_window(self):
+        now = cx.datetime.now(cx.UTC)
+        stamp = lambda s: (now - cx.timedelta(seconds=s)).isoformat()  # noqa: E731
+        r = Repo(
+            [
+                {**turn(1, "00:00:00", "first"), "ts": stamp(86400 + 60)},
+                {**turn(2, "00:00:00", "second"), "ts": stamp(86400 - 30)},
+            ]
+        )
+        try:
+            cfg, root = r.cfg()
+            (wide,), _ = cx.episodes_for(cfg, root, None)
+            (narrow,), _ = cx.episodes_for(cfg, root, 1)
+            self.assertEqual((wide.id, narrow.id), ("t1", "t1"))
+        finally:
+            r.dir.cleanup()
+
+    def test_old_orphan_chat_flags_are_not_reported_in_a_recent_window(self):
+        r = Repo([turn(1, "01:00:00", "a")])
+        try:
+            r.run("flag", "--note", "ancient", "--at", "2020-01-01T00:00:00+00:00")
+            self.assertNotIn("ancient", r.run("episodes", "--days", "7"))
+            self.assertIn("ancient", r.run("episodes", "--days", "100000"))
+        finally:
+            r.dir.cleanup()
+
+    def test_quiet_effects_are_labelled_with_their_turn(self):
+        r = Repo(
+            [
+                turn(1, "01:00:00", "pause", said="Nothing is playing."),
+                turn(
+                    2,
+                    "01:00:20",
+                    "play the radio",
+                    said="Playing.",
+                    effects="speaker: state 'idle'->'playing'",
+                ),
+            ]
+        )
+        try:
+            out = r.run("episodes", "--days", "100000")
+            self.assertIn(
+                "2. 01:00:20 'play the radio': effects: speaker: state 'idle'->'playing'", out
+            )
+        finally:
+            r.dir.cleanup()
+
+
 class LoopTests(unittest.TestCase):
     def setUp(self):
         self.repo = Repo(
