@@ -53,17 +53,23 @@ bd close <id>         # Complete work
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Example:
-# npm install
-# npm test
+python3 -m unittest discover -s voice-cx/test
 ```
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+One directory per skill, each with its own `SKILL.md` and `install.sh`.
+
+| Skill | What | Installed as | Consumers |
+| --- | --- | --- | --- |
+| `circle-back/` | queue a prompt for later (Stop hook) | copied into `~/.claude` | any session |
+| `voice-cx/` | voice-assistant experience loop: judge sessions as the user, flags read literally, ranked small fixes, scorecard | **symlink** `~/.claude/skills/voice-cx` -> this dir | `~/Projects/personal/home-assistant-pi` (reference adapter: `voice/collector/collect.py export-turns`, `voice/cx.json`, `automations/voice_flag.yaml`; documented in its CLAUDE.md "Voice experience loop") |
+
+voice-cx's `cx.py` is called by fixed path (`~/.claude/skills/voice-cx/cx.py`) from
+consuming repos, so its CLI and the turn schema in `ADAPTER.md` are an interface:
+change them compatibly, or update the consumers in the same change. Tests:
+`python3 -m unittest discover -s voice-cx/test` (stdlib only).
 
 ## Conventions & Patterns
 
