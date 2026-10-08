@@ -616,7 +616,11 @@ def scorecard(cfg: dict[str, Any], root: Path, days: int) -> dict[str, Any]:
     episodes, _ = episodes_for(cfg, root, days)
     judged = episode_verdicts(latest_judgments(root, cfg))
     verdicts = collections.Counter(judged[e.id] for e in episodes if e.id in judged)
-    turns = [t for e in episodes for t in e.turns]
+    # Episodes are counted whole, but turn-level metrics only count turns inside
+    # the window, so an episode straddling the cutoff is not in two weeks'
+    # latency or LLM-share figures (roborev #5481).
+    since = datetime.now(UTC) - timedelta(days=days)
+    turns = [t for e in episodes for t in e.turns if _ts(t["ts"]) >= since]
     rated = sum(verdicts[v] for v in ("good", "friction", "bad"))
     flagged = [e for e in episodes if e.flags]
     # Judge calibration: a flag is the user saying "this was not fine".

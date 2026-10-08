@@ -265,6 +265,23 @@ class ReviewFixTests(unittest.TestCase):
         finally:
             r.dir.cleanup()
 
+    def test_scorecard_turn_metrics_ignore_turns_before_the_window(self):
+        now = cx.datetime.now(cx.UTC)
+        stamp = lambda s: (now - cx.timedelta(seconds=s)).isoformat()  # noqa: E731
+        r = Repo(
+            [
+                {**turn(1, "00:00:00", "old", layer="llm", latency_s=9.0), "ts": stamp(86400 + 60)},
+                {**turn(2, "00:00:00", "new", latency_s=0.5), "ts": stamp(86400 - 30)},
+            ]
+        )
+        try:
+            card = cx.scorecard(*r.cfg(), 1)
+            self.assertEqual(card["episodes"], 1)  # the straddling episode, whole
+            self.assertEqual(card["llm_share_pct"], 0)  # the pre-window LLM turn is not counted
+            self.assertEqual(card["latency_p90_s"], 0.5)
+        finally:
+            r.dir.cleanup()
+
     def test_old_orphan_chat_flags_are_not_reported_in_a_recent_window(self):
         r = Repo([turn(1, "01:00:00", "a")])
         try:
