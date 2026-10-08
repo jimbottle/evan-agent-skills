@@ -387,6 +387,12 @@ def cmd_episodes(cfg, root, args) -> int:
             t = e.turns[0]
             more = f"  (+{len(e.turns) - 1} more turns)" if len(e.turns) > 1 else ""
             print(f"  {e.id}  {e.start[:16]}  {t.get('heard')!r} -> {t.get('said')!r}{more}")
+            # A reply that contradicts the effects carries no signal unless the
+            # adapter proved it, so the effects must be on screen to be judged:
+            # "Pause." -> "Nothing is playing." while the radio stopped, 2026-10-06.
+            for u in e.turns:
+                if u.get("effects"):
+                    print(f"      effects: {u['effects']}")
     for f in orphans:
         print(
             f"\nORPHAN FLAG {f['ts'][:19]}: {f.get('reason') or f.get('note')!r} (no turn to attach to)"

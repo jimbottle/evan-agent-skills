@@ -242,6 +242,25 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(card["flags"], 1)
         self.assertEqual(card["good_pct"], 100.0)
 
+    def test_quiet_episodes_still_show_their_effects(self):
+        r = Repo(
+            [
+                turn(
+                    1,
+                    "01:00:00",
+                    "pause",
+                    said="Nothing is playing.",
+                    effects="speaker: state 'playing'->'idle'",
+                )
+            ]
+        )
+        try:
+            self.assertIn(
+                "effects: speaker: state 'playing'->'idle'", r.run("episodes", "--days", "100000")
+            )
+        finally:
+            r.dir.cleanup()
+
     def test_chat_flag_attaches_by_time(self):
         self.repo.run("flag", "--note", "volume did nothing", "--at", "2026-10-06T03:00:30+00:00")
         out = self.repo.run("episodes", "--days", "100000")
