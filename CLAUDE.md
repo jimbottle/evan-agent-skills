@@ -63,7 +63,16 @@ _Add your build and test commands here_
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+One directory per skill, each with its own `SKILL.md` and `install.sh`.
+
+| Skill | What | Installed as |
+| --- | --- | --- |
+| `circle-back/` | queue a prompt for later (Stop hook) | copied into `~/.claude` |
+| `amelignment/` | first-sweep review of in-progress work as Ameet Doshi would; persona in `references/ameet-profile.md`, built per `references/personalize.md` | **symlink** `~/.claude/skills/amelignment` -> this dir |
+
+amelignment's mined source material (Slack/Drive/GitHub) lives in the
+git-ignored `amelignment/references/raw/`; only generalized principles and
+short quotes go in the profile.
 
 ## Conventions & Patterns
 

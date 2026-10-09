@@ -8,3 +8,6 @@
 
 # macOS
 .DS_Store
+
+# amelignment: raw mined Slack/Drive/GitHub material stays local
+amelignment/references/raw/
