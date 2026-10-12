@@ -219,6 +219,14 @@ assert_eq "wake-up turn ending early fires nothing" "" "$(fire "$Q" "$(as "$SID"
 sed -i.bak "1s/^[0-9]*/$PAST/" "$Q"; rm -f "$Q.bak"            # the delay elapses
 assert_eq "once due, the prompt fires" "RUN PROMPT X with more words than six" "$(fire "$Q" "$(as "$SID")" | reason_of)"
 assert_eq "drained" "0" "$(grep -c . "$Q" 2>/dev/null | head -1)"
+# A delay past the two-hour background limit: the timeout is capped there and
+# the wake-up tells the agent to re-arm when the notice arrives early.
+printf 'after+10000:%s\t%s\tthe long one\n' "$(NOW)" "$SID" > "$Q"
+R=$(fire "$Q" "$(as "$SID")" | jq -r '.reason')
+case "$R" in *"timeout 7200000"*) ok "wake-up timeout is capped at the two-hour background limit" ;; *) bad "wake-up timeout is capped at the two-hour background limit" "$R" ;; esac
+case "$R" in *"start the same background wake-up again"*) ok "wake-up re-arms on a notice before the due time" ;; *) bad "wake-up re-arms on a notice before the due time" "$R" ;; esac
+printf 'after+120:%s\t%s\tshort\n' "$(NOW)" "$SID" > "$Q"
+case "$(fire "$Q" "$(as "$SID")" | jq -r '.reason')" in *"timeout 240000"*) ok "a short delay is not capped" ;; *) bad "a short delay is not capped" ;; esac
 # Behind a pending timed entry: the clock does not start until that one has run.
 printf '%s\t%s\tthe timed one\nafter+60:%s\t%s\ttwo minutes after it\n' "$(future 3600)" "$SID" "$(NOW)" "$SID" > "$Q"
 assert_eq "blocked by a pending entry ahead: nothing" "" "$(fire "$Q" "$(as "$SID")")"

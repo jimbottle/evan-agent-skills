@@ -247,11 +247,15 @@ if [ "$CONVERT" -gt 0 ]; then
   } > "$TMP" && mv "$TMP" "$QUEUE"
   # The wake-up: a background Bash command that polls the OS clock and exits
   # at the due time, with a timeout that comfortably covers the delay. Its
-  # completion notice is what ends a turn after the due time.
+  # completion notice is what ends a turn after the due time. A background
+  # command is stopped at two hours (Claude Code clamps the timeout there),
+  # so the timeout is capped and the prompt has the agent re-arm the wait
+  # when the notice arrives before the due time.
   TMO=$(( (CONV_DELAY + 120) * 1000 ))
+  [ "$TMO" -le 7200000 ] || TMO=7200000
   AT=$(fmt_date "$DUE" +%H:%M:%S)
   FEW=$(printf '%s' "$PROMPT" | awk '{n=(NF>6?6:NF); s=$1; for(i=2;i<=n;i++) s=s" "$i; if(NF>6) s=s"..."; print s}')
-  WAKE="circle-back wake-up for the entry due at $AT (epoch $DUE): \"$FEW\". Its ${CONV_DELAY}s timer started just now, when the work ahead of it finished. Do nothing else this turn. If \`date +%s\` is already past $DUE, end the turn with one short line. Otherwise start the wake-up with the Bash tool: run_in_background true, timeout $TMO, description \"circle-back wake-up for '$FEW' due at $AT: when this completes, end the turn with one short line; the Stop hook delivers the queued prompt\", command \`until [ \"\$(date +%s)\" -ge $DUE ]; do sleep 5; done; echo \"circle-back: entry due at $AT (epoch $DUE) -- end the turn; the Stop hook delivers the prompt\"\`. If the Bash tool cannot run in the background, use Monitor with that same command (timeout_ms: the seconds remaining plus 60, in ms, capped at 1800000; re-arm on an early expiry). Then end the turn with one short line. When the completion notice arrives, end that turn with one short line too; the Stop hook delivers the queued prompt."
+  WAKE="circle-back wake-up for the entry due at $AT (epoch $DUE): \"$FEW\". Its ${CONV_DELAY}s timer started just now, when the work ahead of it finished. Do nothing else this turn. If \`date +%s\` is already past $DUE, end the turn with one short line. Otherwise start the wake-up with the Bash tool: run_in_background true, timeout $TMO, description \"circle-back wake-up for '$FEW' due at $AT: when this completes, end the turn with one short line; the Stop hook delivers the queued prompt\", command \`until [ \"\$(date +%s)\" -ge $DUE ]; do sleep 5; done; echo \"circle-back: entry due at $AT (epoch $DUE) -- end the turn; the Stop hook delivers the prompt\"\`. If the Bash tool cannot run in the background, use Monitor with that same command (timeout_ms: the seconds remaining plus 60, in ms, capped at 1800000; re-arm on an early expiry). Then end the turn with one short line. When the completion notice arrives: if \`date +%s\` is still before $DUE, the wait was stopped at the two-hour background limit, so start the same background wake-up again (timeout the seconds remaining plus 120, in ms, capped at 7200000) and end the turn with one short line; otherwise end that turn with one short line and the Stop hook delivers the queued prompt."
   REMAINING=$(grep -c . "$QUEUE" 2>/dev/null || true)
   [ -n "$REMAINING" ] || REMAINING=0
   jq -n --arg p "$WAKE" --arg t "$(fmt_date "$DUE" +%H:%M:%S)" --arg n "$REMAINING" \

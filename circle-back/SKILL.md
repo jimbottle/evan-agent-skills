@@ -56,7 +56,8 @@ Q="${CIRCLE_BACK_QUEUE:-$HOME/.claude/circle-back/$(printf '%s' "$PWD" | shasum 
 mkdir -p "$(dirname "$Q")"
 DUE=$(( $(date +%s) + SECONDS_ARG ))
 printf '%s\t%s\t%s\n' "$DUE" "${CLAUDE_CODE_SESSION_ID:?no session id}" "$PROMPT_ARG" >> "$Q"
-echo "due=$DUE at $(date -r "$DUE" +%H:%M:%S); wake-up timeout $(( (SECONDS_ARG + 120) * 1000 )) ms"
+T=$(( (SECONDS_ARG + 120) * 1000 )); [ "$T" -le 7200000 ] || T=7200000
+echo "due=$DUE at $(date -r "$DUE" +%H:%M:%S); wake-up timeout $T ms"
 ```
 
 The middle field of the entry ties it to THIS session (see `after` below).
@@ -70,17 +71,23 @@ and `HH:MM:SS` with its clock time:
 until [ "$(date +%s)" -ge DUE ]; do sleep 5; done; echo "circle-back: entry due at HH:MM:SS (epoch DUE) -- end the turn; the Stop hook delivers the prompt"
 ```
 
-Pass the printed `timeout` (the delay plus two minutes, in milliseconds; the
-background limit is not the foreground cap, so a long delay is fine) and
-this `description`, with the same substitutions and a few words of the
+Pass the printed `timeout` (the delay plus two minutes, in milliseconds,
+capped at 7200000: a background command may run for two hours at most, so a
+longer wait is stopped at that limit and re-armed, see below) and this
+`description`, with the same substitutions and a few words of the
 queued prompt in the quotes:
 
 > circle-back wake-up for 'first few words...' due at HH:MM:SS: when this
 > completes, end the turn with one short line; the Stop hook delivers the
 > queued prompt
 
-When its completion notice arrives, do exactly that: one short line, then end
-the turn. Do not start on the queued prompt yourself; the hook delivers it
+When its completion notice arrives, first check the clock. If `date +%s` is
+still before the due epoch, the wait was stopped at the two-hour background
+limit, not finished: start the same background wake-up again (same command
+and description; `timeout` the seconds remaining plus 120, in milliseconds,
+capped at 7200000 again) and end the turn with one short line. Otherwise do
+exactly that: one short line, then end the turn. Do not start on the queued
+prompt yourself; the hook delivers it
 (it shows up as "Stop hook feedback"). The wake-up carries no work of its
 own, so it is harmless if the entry has already fired (the session ended a
 turn after the due time) or was cancelled.

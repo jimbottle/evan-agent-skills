@@ -1,4 +1,4 @@
-> **2026-10-12:** the cron wake-up described below was replaced by a background Bash wait on the OS clock (`until date +%s >= due`). Claude Code's scheduler keeps the timezone the session started in, so a cron one-shot drifted an hour after a system timezone change. See SKILL.md, "Delay greater than 0". Everything else here still applies.
+> **2026-10-12:** the cron wake-up described below was replaced by a background Bash wait on the OS clock (`until date +%s >= due`). Claude Code's scheduler keeps the timezone the session started in, so a cron one-shot drifted an hour after a system timezone change. See SKILL.md, "Delay greater than 0". The CronCreate passages below (the fallback note in 4.2 and the two Known-constraints bullets) are kept as history of why the design moved; the rest of the plan still applies.
 
 # circle-back — setup and test plan
 
@@ -196,8 +196,8 @@ printf '%s\tRun: echo "FIRE2D $(date +%%s)" >> /tmp/circle-back-test.log -- then
 
 **If only A fires:** the harness is refusing a second consecutive block. Report
 this rather than working around it — it's a real constraint on the design, and
-the fix is a different mechanism (a one-shot cron carrying the next prompt),
-not a tweak. Capture the `/hooks` output and any `⏺ Stop hook` line shown.
+the fix is a different mechanism (a wake-up started outside the Stop hook,
+as the background Bash wait now does for timed entries), not a tweak. Capture the `/hooks` output and any `⏺ Stop hook` line shown.
 
 ### 4.3 — no interruption
 
@@ -324,12 +324,21 @@ Carry these into the report; none is a bug to fix in this pass.
   never ended another turn. For a while the skill answered this by sending
   timed prompts through the built-in `CronCreate` tool instead of the queue,
   but a cron job is invisible to the queue, so an `after` could not chain onto
-  a timer (2026-09-30). Now every delay is a queue entry with a due time, and
-  `CronCreate` (`recurring: false`) only schedules a wake-up prompt at the due
-  minute: a no-op turn whose Stop lets the hook fire the real entry. If the
-  session ended a turn after the due time first, the entry has already fired
-  and the wake-up is harmless. For a prompt that must fire with no session
-  open, use the `schedule` skill.
+  a timer (2026-09-30). Then every delay became a queue entry with a due time
+  and `CronCreate` (`recurring: false`) only scheduled a wake-up prompt at the
+  due minute: a no-op turn whose Stop let the hook fire the real entry. That
+  wake-up drifted an hour after a system timezone change, because Claude
+  Code's scheduler keeps the session's startup zone (2026-10-12). Since then
+  the wake-up is a background Bash command, `until [ "$(date +%s)" -ge DUE ];
+  do sleep 5; done`, started in the queuing turn (or, for `after+N`, in the
+  wake-up turn the hook blocks with); its completion notice ends a turn after
+  the due time and the Stop hook fires the entry. If the session ended a turn
+  after the due time first, the entry has already fired and the notice is
+  harmless. The wait is a child of the session and is stopped at the Bash
+  tool's two-hour background limit (the timeout is capped there and the
+  wake-up prompt has the agent re-arm the wait when the notice comes early),
+  so a delay of hours is better served by the `schedule` skill, as is any
+  prompt that must fire with no session open.
 - The queue file is keyed by working directory, but each entry carries the
   session id that queued it and fires only in that session. Before this, a
   roborev reviewer (`claude -p` in the same repo) drained a queued
@@ -353,14 +362,17 @@ Carry these into the report; none is a bug to fix in this pass.
   entries an hour overdue.
 - Prompts are one line each; newlines get collapsed. Queued prompts must be
   self-contained, since they arrive with the originating turn out of view.
-- `CronCreate` one-shots (the built-in scheduler behind `/loop`) fire only
-  while the REPL is idle. In the 2026-08-30 live run a one-shot scheduled for
-  19:57 was still pending at 19:59 because a `/goal` Stop hook kept the session
-  continuously busy, while queue entries fired at every Stop. The two
-  mechanisms are complementary: the queue fires at turn boundaries and never
-  while idle; cron fires while idle and never mid-work. That is why the cron
-  job is only a wake-up for a queue entry: whichever of the two happens
-  first, the entry fires once, in order with everything else queued.
+- History: `CronCreate` one-shots (the built-in scheduler behind `/loop`)
+  fire only while the REPL is idle. In the 2026-08-30 live run a one-shot
+  scheduled for 19:57 was still pending at 19:59 because a `/goal` Stop hook
+  kept the session continuously busy, while queue entries fired at every
+  Stop. That idle-only behaviour is why cron was ever only a wake-up for a
+  queue entry, never the carrier of the prompt, and the same split holds for
+  the background Bash wait that replaced it: the queue is the source of
+  truth, the wake-up only ends a turn, and whichever happens first, the entry
+  fires once, in order with everything else queued. A busy session still
+  needs no special handling: the entry fires at the first Stop after it is
+  due and the later completion notice is a no-op.
 - Write queued test prompts so they carry their own follow-through. A prompt
   ending "reply with only X and do nothing else" leaves the session parked
   waiting on you — a test-design trap, not a product defect.
