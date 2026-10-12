@@ -31,17 +31,21 @@
 # An `after+<delay>` entry is an `after` entry whose timer has not started
 # yet. The moment it would otherwise fire, the hook instead rewrites it in
 # place as a timed entry due <delay> seconds from now and blocks with the
-# wake-up prompt for it (the same prompt the skill gives CronCreate), so the
-# agent's next turn is the wake-up: it waits out the delay or schedules a cron
-# wake-up, ends the turn, and the entry fires like any other timed one. The
-# wake-up turn goes before anything queued behind the entry, as a plain
-# `after` would.
+# wake-up prompt for it (the same wake-up the skill has the agent start for a
+# timed entry), so the agent's next turn is the wake-up turn: it starts the
+# background wait, ends the turn, and the entry fires like any other timed
+# one. The wake-up turn goes before anything queued behind the entry, as a
+# plain `after` would.
 #
-# A timed entry's clock is the built-in CronCreate scheduler: the skill also
-# schedules a one-shot wake-up prompt at the due minute, whose only job is to
-# end a turn so this hook runs. The hook knows nothing about cron; if a turn
-# ends after the due time before the wake-up arrives, the entry fires then and
-# the wake-up is a no-op. Keeping timers in the queue is what lets an `after`
+# A timed entry's clock is the OS clock: the skill has the agent start a
+# background Bash command that polls `date +%s` and exits at the due time;
+# its completion notice ends a turn so this hook runs. It is not a CronCreate
+# job on purpose -- Claude Code's scheduler keeps the timezone the session
+# started in, so after a system timezone change a cron one-shot lands hours
+# off while `date` here is right (2026-10-12: a 12:07 wake-up that would have
+# fired at 13:07). The hook knows nothing about the wake-up; if a turn ends
+# after the due time before the notice arrives, the entry fires then and the
+# notice is a no-op. Keeping timers in the queue is what lets an `after`
 # entry chain onto one.
 #
 # Entries belong to the session that queued them. The queue file is keyed by
@@ -224,9 +228,10 @@ scan
 # An after+<delay> entry came unblocked at this Stop: start its timer. Rewrite
 # it in place as a timed entry due <delay> seconds from now, tagged to this
 # session (it owns the wake-up from here on), and make the next turn the
-# wake-up turn by blocking with the same wake-up prompt the skill hands to
-# CronCreate. This goes before any other due entry, as a plain `after` would;
-# that entry fires at the end of the wake-up turn.
+# wake-up turn by blocking with a prompt that spells out the background
+# OS-clock wait the skill uses for a timed entry. This goes before any other
+# due entry, as a plain `after` would; that entry fires at the end of the
+# wake-up turn.
 if [ "$CONVERT" -gt 0 ]; then
   ENTRY=$(sed -n "${CONVERT}p" "$QUEUE")
   TAG=$(entry_sid "$ENTRY")
@@ -240,15 +245,13 @@ if [ "$CONVERT" -gt 0 ]; then
     else printf '%s\t%s\n' "$DUE" "$PROMPT"; fi
     tail -n +$((CONVERT+1)) "$QUEUE"
   } > "$TMP" && mv "$TMP" "$QUEUE"
-  # Wake-up minute: the due time rounded up to a whole minute, at least a
-  # minute out (the agent needs time to schedule it), and never :00 or :30,
-  # where one-shots can arrive up to 90 s early.
-  T=$(( NOW + 60 )); [ "$T" -ge "$DUE" ] || T=$DUE
-  T=$(( (T + 59) / 60 * 60 ))
-  case "$(fmt_date "$T" +%M)" in 00|30) T=$(( T + 60 )) ;; esac
-  CRON=$(fmt_date "$T" '+%M %H %d %m' | awk '{print $1+0, $2+0, $3+0, $4+0, "*"}')
+  # The wake-up: a background Bash command that polls the OS clock and exits
+  # at the due time, with a timeout that comfortably covers the delay. Its
+  # completion notice is what ends a turn after the due time.
+  TMO=$(( (CONV_DELAY + 120) * 1000 ))
+  AT=$(fmt_date "$DUE" +%H:%M:%S)
   FEW=$(printf '%s' "$PROMPT" | awk '{n=(NF>6?6:NF); s=$1; for(i=2;i<=n;i++) s=s" "$i; if(NF>6) s=s"..."; print s}')
-  WAKE="circle-back wake-up for the entry due at $(fmt_date "$DUE" +%H:%M:%S) (epoch $DUE): \"$FEW\". Its ${CONV_DELAY}s timer started just now, when the work ahead of it finished. Do nothing else this turn. If \`date +%s\` is still before $DUE, wait out the remaining seconds (a Bash \`sleep\`, or a Monitor until-loop on \`date +%s\`). If you cannot wait, CronCreate this same prompt (\`recurring: false\`) at \`$CRON\`, or once that minute has passed, at the expression printed by \`N=\$(date +%s); T=\$(( ((N+60>$DUE?N+60:$DUE)+59)/60*60 )); case \$(date -r \$T +%M) in 00|30) T=\$((T+60));; esac; date -r \$T '+%M %H %d %m' | awk '{print \$1+0,\$2+0,\$3+0,\$4+0,\"*\"}'\`. Then end the turn with one short line. The Stop hook delivers the queued prompt."
+  WAKE="circle-back wake-up for the entry due at $AT (epoch $DUE): \"$FEW\". Its ${CONV_DELAY}s timer started just now, when the work ahead of it finished. Do nothing else this turn. If \`date +%s\` is already past $DUE, end the turn with one short line. Otherwise start the wake-up with the Bash tool: run_in_background true, timeout $TMO, description \"circle-back wake-up for '$FEW' due at $AT: when this completes, end the turn with one short line; the Stop hook delivers the queued prompt\", command \`until [ \"\$(date +%s)\" -ge $DUE ]; do sleep 5; done; echo \"circle-back: entry due at $AT (epoch $DUE) -- end the turn; the Stop hook delivers the prompt\"\`. If the Bash tool cannot run in the background, use Monitor with that same command (timeout_ms: the seconds remaining plus 60, in ms, capped at 1800000; re-arm on an early expiry). Then end the turn with one short line. When the completion notice arrives, end that turn with one short line too; the Stop hook delivers the queued prompt."
   REMAINING=$(grep -c . "$QUEUE" 2>/dev/null || true)
   [ -n "$REMAINING" ] || REMAINING=0
   jq -n --arg p "$WAKE" --arg t "$(fmt_date "$DUE" +%H:%M:%S)" --arg n "$REMAINING" \

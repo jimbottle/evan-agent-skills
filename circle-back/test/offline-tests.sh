@@ -156,7 +156,7 @@ assert_eq "timestamped after chains like a bare one" "A" "$(fire "$Q" | reason_o
 assert_eq "timestamped after fires next" "B" "$(fire "$Q" | reason_of)"
 rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
 
-head_ "6d. a timer stacks with an 'after' behind it; the cron wake-up is only a nudge"
+head_ "6d. a timer stacks with an 'after' behind it; the wake-up is only a nudge"
 Q="$WORK/stack.queue"
 SID=33333333-aaaa-bbbb-cccc-000000000003
 register "$SID" $$
@@ -202,17 +202,18 @@ assert_eq "wake-up names the same due epoch" "$DUE_NOW" "$(sed 's/.*(epoch \([0-
 assert_eq "rewritten entry keeps its prompt" "RUN PROMPT X with more words than six" "$(cut -f3 "$Q")"
 assert_eq "rewritten entry is tagged to the firing session" "$SID" "$(cut -f2 "$Q")"
 assert_eq "one line in the queue, not two" "1" "$(grep -c . "$Q")"
-CRON=$(jq -r '.reason' <<<"$OUT" | grep -o 'recurring: false`) at `[^`]*`' | sed 's/.*at `//; s/`$//')
-case "$CRON" in
-  [0-9]*' '[0-9]*' '[0-9]*' '[0-9]*' *') ok "wake-up carries a cron expression ($CRON)" ;;
-  *) bad "wake-up carries a cron expression" "$CRON" ;;
+# The wake-up is a background wait on the OS clock, not a CronCreate job:
+# Claude Code's scheduler keeps the session's startup timezone, so a cron
+# one-shot drifts after a system timezone change (2026-10-12, an hour late).
+R=$(jq -r '.reason' <<<"$OUT")
+case "$R" in
+  *"until [ \"\$(date +%s)\" -ge $DUE_NOW ]; do sleep 5; done"*) ok "wake-up polls the OS clock until the due epoch" ;;
+  *) bad "wake-up polls the OS clock until the due epoch" "$R" ;;
 esac
-case "${CRON%% *}" in 0|30) bad "cron minute avoids :00/:30" "$CRON" ;; *) ok "cron minute avoids :00/:30" ;; esac
-CRON_MIN=${CRON%% *}; DUE_MIN=$(( (DUE_NOW + 59) / 60 * 60 ))
-case "$CRON_MIN" in
-  $(( DUE_MIN / 60 % 60 ))|$(( (DUE_MIN + 60) / 60 % 60 ))) ok "cron minute is the due time rounded up" ;;
-  *) bad "cron minute is the due time rounded up" "due $DUE_NOW -> $CRON" ;;
-esac
+case "$R" in *"run_in_background true"*) ok "wake-up runs in the background" ;; *) bad "wake-up runs in the background" "$R" ;; esac
+case "$R" in *"timeout 240000"*) ok "wake-up timeout covers the delay plus two minutes" ;; *) bad "wake-up timeout covers the delay plus two minutes" "$R" ;; esac
+case "$R" in *"end the turn with one short line"*) ok "wake-up tells the agent to just end the turn" ;; *) bad "wake-up tells the agent to just end the turn" "$R" ;; esac
+case "$R" in *CronCreate*|*"cron"*) bad "wake-up does not rely on cron" "$R" ;; *) ok "wake-up does not rely on cron" ;; esac
 case "$(jq -r '.systemMessage' <<<"$OUT")" in *"timer started"*) ok "user told the timer started" ;; *) bad "user told the timer started" "$OUT" ;; esac
 assert_eq "wake-up turn ending early fires nothing" "" "$(fire "$Q" "$(as "$SID")" | reason_of)"
 sed -i.bak "1s/^[0-9]*/$PAST/" "$Q"; rm -f "$Q.bak"            # the delay elapses

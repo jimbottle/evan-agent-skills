@@ -12,12 +12,12 @@ entry when a turn ends. There are three ways an entry comes due:
 
 - **A clock (`<seconds>`).** The entry carries an absolute due time. Because
   the hook only runs when a turn *ends*, a session sitting idle at the prompt
-  would never notice the due time passing, so a one-shot `CronCreate` job is
-  scheduled for the due minute whose only job is to send a short wake-up
-  prompt. That wake-up ends a turn, the hook sees the entry is due, and the
-  real prompt goes out. If the session is busy at the due time, the entry
-  fires at the next turn end anyway and the wake-up, arriving later, is a
-  no-op.
+  would never notice the due time passing, so a background Bash command is
+  started that waits on the OS clock and exits at the due time. Its
+  completion notice re-invokes the agent, which ends a turn; the hook sees
+  the entry is due, and the real prompt goes out. If the session is busy at
+  the due time, the entry fires at the next turn end anyway and the notice,
+  arriving later, is a no-op.
 - **The previous task finishing (`after`).** The entry has no due time. It
   waits for every entry ahead of it in the queue, timed or not, and fires at
   the end of the turn in which the last of them ran. With nothing ahead of it,
@@ -45,57 +45,68 @@ that starts when the task ahead finishes (see "`after <seconds>`" below), and
 the prompt is everything after it. A prompt that genuinely starts with a
 number goes behind `after 0`, which is a plain `after`.
 
-### Delay greater than 0: queue entry plus a cron wake-up
+### Delay greater than 0: queue entry plus a wake-up on the OS clock
 
 Every entry goes in the queue. Append it with its due time and, in the same
 Bash call (shell variables do not survive between calls), print what the
-wake-up needs: the due epoch, its clock time, and the cron expression. The
-wake-up minute is the due time rounded **up** to a whole minute, pushed one
-more minute when that lands on :00 or :30, since one-shots at those marks can
-arrive up to 90 s early.
+wake-up needs: the due epoch and its clock time.
 
 ```bash
 Q="${CIRCLE_BACK_QUEUE:-$HOME/.claude/circle-back/$(printf '%s' "$PWD" | shasum -a 256 | cut -c1-12).queue}"
 mkdir -p "$(dirname "$Q")"
 DUE=$(( $(date +%s) + SECONDS_ARG ))
 printf '%s\t%s\t%s\n' "$DUE" "${CLAUDE_CODE_SESSION_ID:?no session id}" "$PROMPT_ARG" >> "$Q"
-T=$(( (DUE + 59) / 60 * 60 ))
-case $(date -r "$T" +%M) in 00|30) T=$(( T + 60 )) ;; esac
-echo "due=$DUE at $(date -r "$DUE" +%H:%M:%S); wake-up $(date -r "$T" +%H:%M)"
-echo "cron: $(date -r "$T" '+%M %H %d %m' | awk '{print $1+0, $2+0, $3+0, $4+0, "*"}')"
+echo "due=$DUE at $(date -r "$DUE" +%H:%M:%S); wake-up timeout $(( (SECONDS_ARG + 120) * 1000 )) ms"
 ```
 
 The middle field of the entry ties it to THIS session (see `after` below).
 
-Then schedule the wake-up. Load `CronCreate` with ToolSearch if it's deferred.
-Call it with the printed cron expression as `cron`, `recurring: false`, and
-this as `prompt`. Replace every `DUE` (in the prose and inside the one-liner)
-with the literal due epoch that was printed, `HH:MM:SS` with its clock time,
-and the quoted words with a few words of the queued prompt:
+Then start the wake-up: a second Bash call, run in the background
+(`run_in_background: true`), that polls the OS clock and exits once the due
+time has passed. Replace `DUE` with the literal due epoch that was printed
+and `HH:MM:SS` with its clock time:
 
-> circle-back wake-up for the entry due at HH:MM:SS (epoch DUE): "first few
-> words...". Do nothing else this turn. If `date +%s` is still before DUE,
-> wait out the remaining seconds (a Bash `sleep`, or a Monitor until-loop on
-> `date +%s`). If you cannot wait, CronCreate this same prompt again
-> (`recurring: false`) at the expression printed by
-> `N=$(date +%s); T=$(( ((N+60>DUE?N+60:DUE)+59)/60*60 )); case $(date -r $T +%M) in 00|30) T=$((T+60));; esac; date -r $T '+%M %H %d %m' | awk '{print $1+0,$2+0,$3+0,$4+0,"*"}'`.
-> Then end the turn with one short line. The Stop hook delivers the queued
-> prompt.
+```bash
+until [ "$(date +%s)" -ge DUE ]; do sleep 5; done; echo "circle-back: entry due at HH:MM:SS (epoch DUE) -- end the turn; the Stop hook delivers the prompt"
+```
 
-The wake-up carries no work of its own, so it is harmless if the entry has
-already fired (the session ended a turn after the due time) or was cancelled.
+Pass the printed `timeout` (the delay plus two minutes, in milliseconds; the
+background limit is not the foreground cap, so a long delay is fine) and
+this `description`, with the same substitutions and a few words of the
+queued prompt in the quotes:
 
-Confirm in one line: the due time (clock time, not just the delay), a few
-words of the prompt, and the cron job ID (only for tidying the wake-up out of
-`CronList` later; cancelling is done in the queue, see "Inspecting what's
-pending").
+> circle-back wake-up for 'first few words...' due at HH:MM:SS: when this
+> completes, end the turn with one short line; the Stop hook delivers the
+> queued prompt
 
-If `CronCreate` isn't available in this session, queue the entry anyway and
-say plainly that it fires at the first turn end after the due time, not on
-the clock. A session that is kept continuously busy (a `/goal` or `/loop`
-whose Stop hook keeps blocking) needs no special handling: the entry fires at
-the first turn end after it is due, and the wake-up, which cron only sends at
-an idle moment, arrives later as a no-op.
+When its completion notice arrives, do exactly that: one short line, then end
+the turn. Do not start on the queued prompt yourself; the hook delivers it
+(it shows up as "Stop hook feedback"). The wake-up carries no work of its
+own, so it is harmless if the entry has already fired (the session ended a
+turn after the due time) or was cancelled.
+
+The wake-up polls `date +%s` instead of sleeping for the whole delay so that
+a laptop that slept through the due time fires the entry within seconds of
+waking. It is deliberately NOT a `CronCreate` job: Claude Code's scheduler
+keeps the timezone the session started in, so after a system timezone change
+(travel, or DST on a long-lived session) a cron one-shot lands an hour or
+more off while the shell's clock is right. On 2026-10-12 a wake-up scheduled
+for 12:07 would have fired at 13:07 for exactly this reason. The OS clock has
+no such drift.
+
+Confirm in one line: the due time (clock time, not just the delay) and a few
+words of the prompt. Cancelling is done in the queue, see "Inspecting what's
+pending".
+
+If the Bash tool cannot run in the background in this session, use `Monitor`
+with the same `until` loop as its command and `timeout_ms` of the delay plus
+a minute, capped at 30 minutes: both its event and its expiry notice end a
+turn, and on an expiry before the due time, re-arm it. With neither, queue
+the entry anyway and say plainly that it fires at the first turn end after
+the due time, not on the clock. A session that is kept continuously busy (a
+`/goal` or `/loop` whose Stop hook keeps blocking) needs no special handling:
+the entry fires at the first turn end after it is due, and the completion
+notice, arriving later, is a no-op.
 
 ### `after`, "after this is done", "then...": append to the queue
 
@@ -134,16 +145,16 @@ mkdir -p "$(dirname "$Q")"
 printf 'after+%s:%s\t%s\t%s\n' "$SECONDS_ARG" "$(date +%s)" "${CLAUDE_CODE_SESSION_ID:?no session id}" "$PROMPT_ARG" >> "$Q"
 ```
 
-The first field is `after+<seconds>` plus the time it was queued. No cron
-wake-up is scheduled now: there is nothing to schedule it for, since the due
+The first field is `after+<seconds>` plus the time it was queued. No
+wake-up is started now: there is nothing to start it for, since the due
 time is not known until the task ahead ends. The entry waits exactly like a
 plain `after`. At the Stop where a plain `after` would fire, the hook instead
 rewrites this entry in place as a timed entry due `<seconds>` from that
 moment and blocks with the wake-up prompt for it, so the very next turn is
-the wake-up turn: the agent waits out the delay (or `CronCreate`s a wake-up
-at the minute the prompt names, if the wait is long), ends the turn, and the
-entry fires. From then on it is an ordinary timed entry, and cancelling it is
-dropping its queue line, as usual.
+the wake-up turn: the agent starts the background wake-up the prompt spells
+out (the same `until` loop as above), ends the turn, and the entry fires when
+the wake-up's completion notice ends the turn after it. From then on it is an
+ordinary timed entry, and cancelling it is dropping its queue line, as usual.
 
 Confirm in one line: the delay, that it starts when the work ahead ends, what
 that work is (as for `after`), and a few words of the prompt: "fires 2 min
@@ -154,7 +165,7 @@ timed entry or the `schedule` skill: the wake-up turn needs the session open.
 ### Delay 0: due now, ahead of anything pending
 
 A `0` delay is a timed entry with the current time as its due time and no
-cron wake-up (the current turn ending is the wake-up):
+wake-up (the current turn ending is the wake-up):
 
 ```bash
 printf '%s\t%s\t%s\n' "$(date +%s)" "${CLAUDE_CODE_SESSION_ID:?no session id}" "$PROMPT_ARG" >> "$Q"
@@ -172,30 +183,30 @@ Scheduling is the whole job.
 ## Limits to tell the user about
 
 - **The session has to stay open.** The queue and the wake-up both live in
-  this Claude Code session. `CronCreate` jobs are in memory only and are gone
-  when Claude exits (they do not survive a restart or `--resume`); the queue
-  entry survives, but with no wake-up it fires only at the first turn end
-  after its due time, and only once an attended session in this directory
-  adopts it. If the machine sleeps, the wake-up fires when it wakes, as long
-  as the session is still open. For prompts that must run with no session
-  open, use the `schedule` skill (cloud routines).
-- **Cron granularity is one minute.** The wake-up lands at the due time
-  rounded up to the minute, or one minute later when that is :00 or :30
-  (one-shots at those marks can arrive up to 90 s early). The wake-up prompt
-  also tells the agent to sleep off any remainder, so the entry fires at or
-  after its due second; the cost is up to two minutes of slop.
-- **Queue entries fire only when a turn ends.** Without the wake-up (no
-  `CronCreate` in the session), say plainly that the entry waits for the next
-  turn to end after the due time, not for the clock.
+  this Claude Code session. The background wake-up is a child of the session
+  and is gone when Claude exits (it does not survive a restart or
+  `--resume`); the queue entry survives, but with no wake-up it fires only at
+  the first turn end after its due time, and only once an attended session in
+  this directory adopts it. If the machine sleeps, the wake-up fires within
+  seconds of it waking, as long as the session is still open. For prompts
+  that must run with no session open, use the `schedule` skill (cloud
+  routines).
+- **The wake-up lands within seconds of the due time.** It polls the clock
+  every 5 s, so the entry fires at or just after its due second, plus the
+  one-line wake-up turn.
+- **Queue entries fire only when a turn ends.** Without a wake-up (no
+  background Bash or `Monitor` in the session), say plainly that the entry
+  waits for the next turn to end after the due time, not for the clock.
 - **An `after` entry waits for everything ahead of it in the queue,** even an
   entry due hours from now. Say what it is waiting on when you confirm.
-- **The wake-up is a visible turn.** It shows in the transcript as a prompt
-  and a one-line reply before the queued prompt runs. For `after <seconds>`
-  there is no cron job at all until that turn: the hook delivers the wake-up
-  prompt directly as "Stop hook feedback" the moment the timer starts, and
-  the agent sleeps or schedules a cron wake-up from there. Like a plain
-  `after`, that turn goes before anything queued behind the entry; a timed
-  entry behind it that is already due fires when the wake-up turn ends.
+- **The wake-up is a visible turn.** It shows in the transcript as a
+  completion notice and a one-line reply before the queued prompt runs. For
+  `after <seconds>` there are two such turns: the hook delivers the wake-up
+  prompt directly as "Stop hook feedback" the moment the timer starts, the
+  agent starts the background wake-up from there, and the notice turn follows
+  at the due time. Like a plain `after`, the wake-up turn goes before
+  anything queued behind the entry; a timed entry behind it that is already
+  due fires when the wake-up turn ends.
 
 ## Rules
 
@@ -221,7 +232,7 @@ Scheduling is the whole job.
 
 ## Inspecting what's pending
 
-The queue is the source of truth. `CronList` shows only the wake-ups.
+The queue is the source of truth; the background wake-ups are only nudges.
 
 Queue entries, in file order, with due times rendered (a legacy two-field
 entry shows its prompt in the session column):
@@ -249,11 +260,10 @@ sed "${N}d" "$Q" > "$Q.tmp" && mv "$Q.tmp" "$Q"
 ```
 
 Cancelling a timed entry means dropping its queue line. That is the whole
-cancel: every wake-up for it, including any a wake-up rescheduled for itself
-under a new job ID, is then a harmless no-op. `CronDelete` what `CronList`
-shows for it if you want the transcript quiet, but the ID from the original
-confirmation may be stale. Deleting only the cron job does not cancel
-anything: the entry still fires at the next turn end after its due time.
+cancel: its wake-up, when it lands, is then a harmless no-op. `TaskStop` the
+background wake-up if you want the transcript quiet. Stopping only the
+wake-up does not cancel anything: the entry still fires at the next turn end
+after its due time.
 
 ## How the queue fires
 
@@ -269,9 +279,10 @@ the file is one this session may fire; once none is left it counts as due, and
 fires at that Stop. An `after+<seconds>` entry is skipped the same way, but
 once unblocked it is not fired: the hook rewrites it as a timed entry due
 `<seconds>` from that Stop, retagged to the session that did the rewrite, and
-blocks with its wake-up prompt instead (the same text the skill gives
-`CronCreate`, with the due epoch and cron expression filled in). The timed
-entry then fires at the first Stop after its due time, like any other. Since each fire removes one line and the fired prompt runs
+blocks with its wake-up prompt instead (which spells out the background
+wake-up command with the due epoch filled in). The timed entry then fires at
+the first Stop after its due time, like any other. Since each fire removes
+one line and the fired prompt runs
 in the next turn, "the entry ahead of it is gone" and "the previous task's
 turn has ended" are the same moment. When the registry can't say whether an
 `after` entry's owner is still running, the hour-overdue fallback measures
