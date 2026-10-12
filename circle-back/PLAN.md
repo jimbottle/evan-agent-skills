@@ -1,3 +1,5 @@
+> **2026-10-12:** the cron wake-up described below was replaced by a background Bash wait on the OS clock (`until date +%s >= due`). Claude Code's scheduler keeps the timezone the session started in, so a cron one-shot drifted an hour after a system timezone change. See SKILL.md, "Delay greater than 0". Everything else here still applies.
+
 # circle-back — setup and test plan
 
 Executable plan for a Claude Code agent. Work top to bottom. Every step has an
