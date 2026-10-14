@@ -21,7 +21,8 @@ entry when a turn ends. There are three ways an entry comes due:
 - **The previous task finishing (`after`).** The entry has no due time. It
   waits for every entry ahead of it in the queue, timed or not, and fires at
   the end of the turn in which the last of them ran. With nothing ahead of it,
-  that is the end of the work in flight right now.
+  that is the end of the work in flight right now, including any background
+  work it is waiting on (see "Background work" below).
 - **A clock that starts when the previous task finishes (`after <seconds>`).**
   An `after` entry carrying a delay. It waits like a plain `after`, and at the
   moment it would have fired, the hook starts its timer instead: the entry
@@ -141,8 +142,30 @@ the report when the check's turn ends.
 
 Before confirming, look at what is ahead of it (the listing under "Inspecting
 what's pending", filtered to this session) and say so: "fires after 'check the
-deploy' (due 11:00)" or "fires when the current work ends". The user may have
-meant the other one.
+deploy' (due 11:00)" or "fires when the current work ends". If you have
+background work running that the task is waiting on (a CI watch, a build, an
+async subagent), name it: "fires once the CI watch finishes and that turn
+ends". The user may have meant the other one.
+
+#### Background work
+
+A turn ending is not always the task ending. While you wait on a background
+command, a `Monitor` or an async subagent, you end turns to wait, and each
+completion notice starts another. So an `after` entry (plain or with a delay)
+is also held while the session's transcript shows a background task started
+with no final notice (completed, failed, killed or stopped) delivered yet.
+It comes due at the Stop that ends the turn that handled the last notice,
+and an `after <seconds>` timer starts only then. While it is held, the hook
+says so at each Stop ("circle-back: holding '...' until 2 background task(s)
+finish: ..."). Not counted: circle-back's own wake-ups, a persistent `Monitor`
+(it never ends), and tasks older than `CIRCLE_BACK_BG_MAX_WAIT` seconds
+(default 14400, 4 hours; `0` turns this wait off) or older than the running
+Claude Code process. Timed entries are not held: a clock is a clock.
+
+So a background task that is not something the work waits on, such as a dev
+server left running, holds every `after` entry until it is stopped. If the
+hook reports holding for a task like that, tell the user and offer to stop it
+(`TaskStop`) rather than leaving the entry stuck.
 
 ### `after <seconds>`: a timer that starts when the task ahead finishes
 
@@ -155,7 +178,8 @@ printf 'after+%s:%s\t%s\t%s\n' "$SECONDS_ARG" "$(date +%s)" "${CLAUDE_CODE_SESSI
 The first field is `after+<seconds>` plus the time it was queued. No
 wake-up is started now: there is nothing to start it for, since the due
 time is not known until the task ahead ends. The entry waits exactly like a
-plain `after`. At the Stop where a plain `after` would fire, the hook instead
+plain `after`, background work included: the clock does not start while a
+CI watch or build the task is waiting on is still running. At the Stop where a plain `after` would fire, the hook instead
 rewrites this entry in place as a timed entry due `<seconds>` from that
 moment and blocks with the wake-up prompt for it, so the very next turn is
 the wake-up turn: the agent starts the background wake-up the prompt spells
@@ -205,7 +229,8 @@ Scheduling is the whole job.
   background Bash or `Monitor` in the session), say plainly that the entry
   waits for the next turn to end after the due time, not for the clock.
 - **An `after` entry waits for everything ahead of it in the queue,** even an
-  entry due hours from now. Say what it is waiting on when you confirm.
+  entry due hours from now, and for the session's running background tasks.
+  Say what it is waiting on when you confirm.
 - **The wake-up is a visible turn.** It shows in the transcript as a
   completion notice and a one-line reply before the queued prompt runs. For
   `after <seconds>` there are two such turns: the hook delivers the wake-up
@@ -283,7 +308,9 @@ delivered alongside it, not instead of it.
 
 An `after` entry has no due time. It is skipped while any entry ahead of it in
 the file is one this session may fire; once none is left it counts as due, and
-fires at that Stop. An `after+<seconds>` entry is skipped the same way, but
+fires at that Stop, unless the session still has background work running
+(see "Background work"), in which case it stays put and the hook's system
+message names the tasks. An `after+<seconds>` entry is skipped the same way, but
 once unblocked it is not fired: the hook rewrites it as a timed entry due
 `<seconds>` from that Stop, retagged to the session that did the rewrite, and
 blocks with its wake-up prompt instead (which spells out the background

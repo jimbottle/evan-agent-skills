@@ -48,6 +48,18 @@
 # notice is a no-op. Keeping timers in the queue is what lets an `after`
 # entry chain onto one.
 #
+# "The task ahead finished" also means the session's background work is done.
+# An agent waiting on a background command (a CI watch, a build, an async
+# subagent) ends its turn to wait, and that Stop is not the end of the task:
+# an `after` entry fired there lands mid-task, and an `after+<delay>` timer
+# starts while the work is still running (2026-10-13: `/circle-back after 180
+# /roborev-fix` started its timer while the agent was still waiting on CI).
+# So an `after` entry is also held while this session's transcript shows a
+# background task started with no final notice yet. Each notice ends a turn, so
+# the entry fires at the Stop after the last one. circle-back's own wake-ups
+# don't count, nor do tasks older than BG_MAX_WAIT or older than the running
+# process (a resumed session's tasks died with the old one).
+#
 # Entries belong to the session that queued them. The queue file is keyed by
 # directory, and OTHER Claude Code sessions run in the same directory -- a
 # roborev reviewer (`claude -p`) finishing its review is a Stop too, and it
@@ -67,6 +79,9 @@ CWD=$(jq -r '.cwd // empty' <<<"$INPUT")
 SID=$(jq -r '.session_id // empty' <<<"$INPUT")
 [ -n "$SID" ] || SID="${CLAUDE_CODE_SESSION_ID:-}"
 ATTENDED="${CLAUDE_CODE_SESSION_ATTENDED:-0}"
+TRANSCRIPT=$(jq -r '.transcript_path // empty' <<<"$INPUT")
+BG_MAX_WAIT="${CIRCLE_BACK_BG_MAX_WAIT:-14400}"
+case "$BG_MAX_WAIT" in ''|*[!0-9]*) BG_MAX_WAIT=14400 ;; esac
 
 # An attended session adopts another session's due entry once that session is
 # gone (/clear starts a new id; a closed or crashed terminal never stops
@@ -97,24 +112,29 @@ entry_sid() {
 # registry says -- a crashed session's pid can be reused. Parsed with jq, not
 # grepped, so formatting changes can't hide a live session. Loaded lazily:
 # only a foreign tagged entry needs it.
-LIVE_SIDS=""; REG_LOADED=0; REG_OK=0; REG_BAD=0
+LIVE_SIDS=""; REG_LOADED=0; REG_OK=0; REG_BAD=0; MY_START=0
 load_registry() {
   [ "$REG_LOADED" = 1 ] && return; REG_LOADED=1
   [ -d "$SESSIONS_DIR" ] || return
-  local f row pid sid pstart actual
+  local f row pid sid pstart started actual
   for f in "$SESSIONS_DIR"/*.json; do
     [ -f "$f" ] || continue
     # A file that won't parse (maybe caught mid-rewrite) could be a live
     # session's; don't read its absence as "gone" -- distrust the registry.
-    row=$(jq -r '[(.pid // "" | tostring), (.sessionId // ""), (.procStart // "")] | @tsv' "$f" 2>/dev/null) \
+    # procStart last: tab is IFS whitespace, so an empty field would collapse.
+    row=$(jq -r '[(.pid // "" | tostring), (.sessionId // ""), (.startedAt // 0 | tostring), (.procStart // "")] | @tsv' "$f" 2>/dev/null) \
       || { REG_BAD=1; continue; }
-    IFS=$'\t' read -r pid sid pstart <<<"$row"
+    IFS=$'\t' read -r pid sid started pstart <<<"$row"
     case "$pid" in ''|*[!0-9]*) REG_BAD=1; continue ;; esac
     [ -n "$sid" ] || { REG_BAD=1; continue; }
     kill -0 "$pid" 2>/dev/null || continue
     if [ -n "$pstart" ]; then
       actual=$(TZ=UTC ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//')
       [ "$actual" = "$(printf '%s' "$pstart" | tr -s ' ')" ] || continue
+    fi
+    # When this process started: background tasks older than that are dead.
+    if [ -n "$SID" ] && [ "$sid" = "$SID" ]; then
+      case "$started" in ''|*[!0-9]*) ;; *) MY_START=$(( started / 1000 )) ;; esac
     fi
     LIVE_SIDS="$LIVE_SIDS$sid"$'\n'
   done
@@ -146,6 +166,73 @@ eligible() {
   [ "$rc" -eq 2 ] && [ -n "$2" ] && [ $(( NOW - $2 )) -ge "$ADOPT_AFTER" ]
 }
 
+# This session's background tasks still running, per its transcript: one
+# description per line in BG_RUNNING, their count in BG_N. A task starts with a
+# tool result carrying its id (Bash `backgroundTaskId`, including a command
+# moved to the background at its timeout; Monitor `taskId`; an async Agent's
+# `agentId`) and ends with a <task-notification> carrying that id and a final
+# status, once delivered to the agent. A persistent Monitor never ends, so it
+# is no task to wait on. Loaded lazily: only an `after` entry about to come
+# due needs it. Pass 1 finds unfinished task ids; pass 2 looks up their
+# tool calls to drop circle-back's own wake-ups and to name the rest.
+BG_LOADED=0; BG_N=0; BG_RUNNING=""
+# Lines of file $1 containing any of the fixed strings $2..., in file order.
+# perl when present: BSD grep takes ~0.7s on a 26 MB transcript, perl ~0.05s.
+lines_with() {
+  local f=$1; shift
+  if command -v perl >/dev/null 2>&1; then
+    perl -ne 'BEGIN { @n = splice(@ARGV, 1) } for $n (@n) { if (index($_, $n) >= 0) { print; last } }' "$f" "$@" </dev/null 2>/dev/null
+  else
+    local a=() n; for n in "$@"; do a+=(-e "$n"); done
+    grep -F "${a[@]}" "$f" </dev/null 2>/dev/null
+  fi
+}
+load_background() {
+  [ "$BG_LOADED" = 1 ] && return; BG_LOADED=1
+  [ "$BG_MAX_WAIT" -gt 0 ] && [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ] || return
+  load_registry
+  local since=$(( NOW - BG_MAX_WAIT )) open tid tuid call desc
+  [ "$MY_START" -le "$since" ] || since=$MY_START
+  open=$(lines_with "$TRANSCRIPT" backgroundTaskId '"taskId"' async_launched '<task-notification>' |
+    jq -rn --argjson since "$since" '
+      def ts: (.timestamp // "" | sub("\\.[0-9]+Z$"; "Z") | try fromdate catch 0);
+      def texts: (.message.content? | if type == "string" then . elif type == "array"
+                    then (.[] | objects | select(.type == "text") | .text // empty) else empty end),
+                 (.attachment.prompt? | strings);
+      reduce (inputs | objects) as $e ({s: {}, d: {}};
+        ( if $e.type == "user" and ($e.toolUseResult | type) == "object" then
+            ($e.toolUseResult | if .persistent == true then null
+               else .backgroundTaskId // .taskId // (if .status == "async_launched" then .agentId else null end) end) as $id
+            | if ($id | type) == "string" and ($e | ts) >= $since
+              then .s[$id] = ([$e.message.content | arrays | .[] | objects | .tool_use_id // empty][0] // "")
+              else . end
+          else . end )
+        | reduce ($e | texts | scan("<task-notification>[\\s\\S]*?</task-notification>")
+                  | select(test("<status>(completed|failed|killed|stopped)</status>"))
+                  | capture("<task-id>(?<id>[^<]+)</task-id>").id) as $id (.; .d[$id] = true))
+      | . as $st | $st.s | to_entries[] | select($st.d[.key] | not) | "\(.key)\t\(.value)"' 2>/dev/null)
+  [ -n "$open" ] || return
+  # Pass 2: one read of the transcript for all their tool calls, as
+  # <tool_use_id>\t<1 if a circle-back wake-up>\t<description>.
+  local needles=() calls
+  while IFS=$'\t' read -r tid tuid; do [ -z "$tuid" ] || needles+=("\"id\":\"$tuid\""); done <<<"$open"
+  calls=""
+  [ "${#needles[@]}" -eq 0 ] || calls=$(lines_with "$TRANSCRIPT" "${needles[@]}" |
+    jq -r '.message.content[]? | objects | select(.type == "tool_use") | .id as $id | .input
+           | [$id, (if (tostring | test("circle-back wake-up|circle-back: entry due")) then 1 else 0 end),
+              (.description // "" | gsub("[\t\n]"; " "))] | @tsv' 2>/dev/null)
+  while IFS=$'\t' read -r tid tuid; do
+    desc=$tid
+    if [ -n "$tuid" ]; then
+      call=$(awk -F '\t' -v u="$tuid" '$1 == u { print; exit }' <<<"$calls")
+      case "$call" in *$'\t'1$'\t'*) continue ;; esac
+      call=${call#*$'\t'}; call=${call#*$'\t'}
+      [ -z "$call" ] || desc=$call
+    fi
+    BG_N=$((BG_N+1)); BG_RUNNING="$BG_RUNNING$desc"$'\n'
+  done <<<"$open"
+}
+
 # Scan the queue once. Sets TARGET (line number of the entry to fire, 0 if
 # none), BEST (its due time) and DUE_N (how many entries this session could
 # fire right now). Picks the due entry with the earliest due time (ties:
@@ -157,7 +244,7 @@ eligible() {
 # it goes before anything queued behind it.
 scan() {
   local LINE DUE AFTER REF DELAY AHEAD=0
-  TARGET=0; BEST=0; DUE_N=0; N=0; CONVERT=0; CONV_DELAY=0
+  TARGET=0; BEST=0; DUE_N=0; N=0; CONVERT=0; CONV_DELAY=0; HELD=0
   while IFS= read -r LINE || [ -n "$LINE" ]; do
     N=$((N+1))
     [ -n "$LINE" ] || continue
@@ -179,6 +266,12 @@ scan() {
     eligible "$LINE" "$REF" || continue          # another session's entry: leave it
     if [ "$AFTER" = 1 ] && [ "$AHEAD" = 1 ]; then continue; fi  # waits for what is ahead
     AHEAD=1
+    # Nothing queued ahead, but the task ahead may still be running in the
+    # background: hold the entry (and so everything chained behind it).
+    if [ "$AFTER" = 1 ]; then
+      load_background
+      if [ "$BG_N" -gt 0 ]; then [ "$HELD" -gt 0 ] || HELD=$N; continue; fi
+    fi
     # An after+<delay> entry that just came unblocked: its timer starts now.
     # Not due yet -- it is rewritten as a timed entry below, after the scan.
     if [ "$AFTER" = 1 ] && [ "$DELAY" -gt 0 ]; then CONVERT=$N; CONV_DELAY=$DELAY; continue; fi
@@ -264,8 +357,19 @@ if [ "$CONVERT" -gt 0 ]; then
 fi
 
 # Nothing due yet: end the turn normally. This is the common case and is what
-# keeps the session interactive while long entries are pending.
-[ "$TARGET" -gt 0 ] || exit 0
+# keeps the session interactive while long entries are pending. If an `after`
+# entry is being held for background work, say what it is waiting on.
+if [ "$TARGET" -eq 0 ]; then
+  if [ "$HELD" -gt 0 ]; then
+    ENTRY=$(sed -n "${HELD}p" "$QUEUE")
+    PROMPT=${ENTRY#*$'\t'}
+    [ -z "$(entry_sid "$ENTRY")" ] || PROMPT=${PROMPT#*$'\t'}
+    FEW=$(printf '%s' "$PROMPT" | awk '{n=(NF>6?6:NF); s=$1; for(i=2;i<=n;i++) s=s" "$i; if(NF>6) s=s"..."; print s}')
+    jq -n --arg p "$FEW" --arg n "$BG_N" --arg l "$(printf '%s' "$BG_RUNNING" | awk 'NF { printf "%s%s", (n++ ? "; " : ""), $0 }')" \
+      '{systemMessage:("circle-back: holding \"" + $p + "\" until " + $n + " background task(s) finish: " + $l)}'
+  fi
+  exit 0
+fi
 
 ENTRY=$(sed -n "${TARGET}p" "$QUEUE")
 PROMPT=${ENTRY#*$'\t'}

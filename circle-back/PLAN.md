@@ -1,3 +1,5 @@
+> **2026-10-13:** an `after` entry (plain or `after <seconds>`) is now also held while the session has background tasks running (background Bash, Monitor, async agents, read from the transcript), so a turn the agent ends to wait on CI no longer counts as the task finishing. See SKILL.md, "Background work".
+
 > **2026-10-12:** the cron wake-up described below was replaced by a background Bash wait on the OS clock (`until date +%s >= due`). Claude Code's scheduler keeps the timezone the session started in, so a cron one-shot drifted an hour after a system timezone change. See SKILL.md, "Delay greater than 0". The CronCreate passages below (the fallback note in 4.2 and the two Known-constraints bullets) are kept as history of why the design moved; the rest of the plan still applies.
 
 # circle-back — setup and test plan
@@ -21,7 +23,7 @@ $SRC/test/offline-tests.sh
 
 ## Definition of done
 
-- `bash test/offline-tests.sh` reports 0 failures (103 assertions)
+- `bash test/offline-tests.sh` reports 0 failures (165 assertions)
 - `/hooks` lists `circle-back.sh` under Stop
 - A single queued prompt fires after its delay, unprompted
 - Two queued prompts fire in order across consecutive turns
@@ -77,7 +79,7 @@ cd "$SRC" && bash test/offline-tests.sh
 ```
 
 **Pass condition:** final line reads `N passed, 0 failed`, exit status 0.
-Expect 103 assertions across 21 groups.
+Expect 165 assertions across 23 groups.
 
 Any failure → stop and report the failing group verbatim. Do not install over a
 red harness.

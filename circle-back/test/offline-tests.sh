@@ -266,6 +266,109 @@ fire "$Q" "$(as "$SID")" >/dev/null
 assert_eq "rewrite preserves metacharacters" 'fix the "auth" bug; echo $HOME `whoami` \n not a newline' "$(cut -f3 "$Q")"
 rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
 
+head_ "6f. 'after' waits for the session's background tasks to finish"
+# 2026-10-13: the agent ended its turn to wait on a background CI watch, and
+# that Stop started '/circle-back after 180 /roborev-fix's timer mid-task.
+# Fake transcripts carry just the records the hook reads: the tool call, the
+# tool result naming the task id, and the <task-notification> that ends it.
+Q="$WORK/bg.queue"; TR="$WORK/bg.jsonl"
+BGSID=33333333-aaaa-bbbb-cccc-000000000003
+iso() { date -u -r "$1" +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%S.000Z; }
+withtr() { jq -nc --arg s "$BGSID" --arg t "$TR" '{cwd:"/tmp",session_id:$s,transcript_path:$t}'; }
+sysmsg() { jq -r '.systemMessage // empty' 2>/dev/null; }
+call() { # tool_use_id tool description [command] [at_epoch]
+  jq -nc --arg u "$1" --arg n "$2" --arg d "$3" --arg c "${4:-true}" --arg ts "$(iso "${5:-$(NOW)}")" \
+    '{type:"assistant",timestamp:$ts,message:{content:[{type:"tool_use",id:$u,name:$n,input:{description:$d,command:$c,run_in_background:true}}]}}' >> "$TR"
+}
+started() { # tool_use_id toolUseResult-json [at_epoch]
+  jq -nc --arg u "$1" --argjson r "$2" --arg ts "$(iso "${3:-$(NOW)}")" \
+    '{type:"user",timestamp:$ts,message:{content:[{type:"tool_result",tool_use_id:$u,content:"started"}]},toolUseResult:$r}' >> "$TR"
+}
+note() { printf '<task-notification>\n<task-id>%s</task-id>\n<status>%s</status>\n</task-notification>' "$1" "${2:-completed}"; }
+delivered() { jq -nc --arg c "$(note "$1" "${2:-completed}")" '{type:"user",message:{role:"user",content:$c}}' >> "$TR"; }
+bgbash() { call "tu_$1" Bash "${2:-Wait for CI}" "${3:-true}" "${4:-}"; started "tu_$1" "{\"backgroundTaskId\":\"$1\"}" "${4:-}"; }
+register "$BGSID" $$
+: > "$TR"; bgbash b1 "Wait for the CI run"
+printf 'after:%s\t%s\tright after\n' "$(NOW)" "$BGSID" > "$Q"
+OUT=$(fire "$Q" "$(withtr)")
+assert_eq "held while a background command runs" "" "$(reason_of <<<"$OUT")"
+assert_eq "...and says what it waits on" 'circle-back: holding "right after" until 1 background task(s) finish: Wait for the CI run' "$(sysmsg <<<"$OUT")"
+assert_eq "...entry retained" "1" "$(grep -c . "$Q")"
+jq -nc --arg c "$(note b1)" '{type:"queue-operation",operation:"enqueue",content:$c}' >> "$TR"
+assert_eq "a notice queued but not yet delivered still holds" "" "$(fire "$Q" "$(withtr)" | reason_of)"
+delivered b1
+assert_eq "fires at the Stop after the notice is delivered" "right after" "$(fire "$Q" "$(withtr)" | reason_of)"
+# Every final status ends a task; a notice delivered mid-turn arrives as an attachment.
+for st in failed killed stopped; do
+  : > "$TR"; bgbash "s_$st"; delivered "s_$st" "$st"
+  printf 'after\t%s\tx\n' "$BGSID" > "$Q"
+  assert_eq "status $st ends the task" "x" "$(fire "$Q" "$(withtr)" | reason_of)"
+done
+: > "$TR"; bgbash a1
+jq -nc --arg c "$(note a1)" '{type:"attachment",attachment:{type:"queued_command",prompt:$c}}' >> "$TR"
+printf 'after\t%s\tx\n' "$BGSID" > "$Q"
+assert_eq "a notice delivered as an attachment ends the task" "x" "$(fire "$Q" "$(withtr)" | reason_of)"
+# Two tasks: the entry waits for both, one notice per turn.
+: > "$TR"; bgbash t1 "build"; bgbash t2 "tests"
+printf 'after\t%s\tafter both\n' "$BGSID" > "$Q"
+assert_eq "two running: lists both" 'circle-back: holding "after both" until 2 background task(s) finish: build; tests' "$(fire "$Q" "$(withtr)" | sysmsg)"
+delivered t1
+assert_eq "one left: still held" "" "$(fire "$Q" "$(withtr)" | reason_of)"
+delivered t2
+assert_eq "both done: fires" "after both" "$(fire "$Q" "$(withtr)" | reason_of)"
+# after+N: the timer does not start while background work runs.
+: > "$TR"; bgbash c1
+printf 'after+120:%s\t%s\t/roborev-fix\n' "$(NOW)" "$BGSID" > "$Q"
+assert_eq "after+N: no wake-up while held" "" "$(fire "$Q" "$(withtr)" | reason_of)"
+assert_eq "after+N: not converted while held" "after+120" "$(cut -f1 "$Q" | sed 's/:.*//')"
+delivered c1
+fire "$Q" "$(withtr)" | reason_of | grep -q '^circle-back wake-up' && ok "after+N: timer starts once the task is done" \
+  || bad "after+N: timer starts once the task is done"
+# circle-back's own wake-up is not work to wait for -- or a timer could never fire its chain.
+: > "$TR"; call tu_w1 Bash "circle-back wake-up for 'x' due at 12:00:00: when this completes, end the turn" \
+  'until [ "$(date +%s)" -ge 1 ]; do sleep 5; done; echo "circle-back: entry due at 12:00:00 (epoch 1) -- end the turn"'
+started tu_w1 '{"backgroundTaskId":"w1"}'
+printf 'after\t%s\tnot held by wake-ups\n' "$BGSID" > "$Q"
+assert_eq "a circle-back wake-up does not hold" "not held by wake-ups" "$(fire "$Q" "$(withtr)" | reason_of)"
+# Monitor (non-persistent) and async Agent tasks count; a persistent Monitor never ends, so it doesn't.
+: > "$TR"; call tu_m1 Monitor "watch deploy"; started tu_m1 '{"taskId":"m1","timeoutMs":300000,"persistent":false}'
+printf 'after\t%s\tx\n' "$BGSID" > "$Q"
+assert_eq "a Monitor holds" 'circle-back: holding "x" until 1 background task(s) finish: watch deploy' "$(fire "$Q" "$(withtr)" | sysmsg)"
+: > "$TR"; call tu_m2 Monitor "tail logs"; started tu_m2 '{"taskId":"m2","persistent":true}'
+assert_eq "a persistent Monitor does not hold" "x" "$(fire "$Q" "$(withtr)" | reason_of)"
+: > "$TR"; call tu_g1 Agent "review the diff"; started tu_g1 '{"agentId":"ag1","status":"async_launched","isAsync":true}'
+printf 'after\t%s\tx\n' "$BGSID" > "$Q"
+assert_eq "an async Agent holds" 'circle-back: holding "x" until 1 background task(s) finish: review the diff' "$(fire "$Q" "$(withtr)" | sysmsg)"
+delivered ag1
+assert_eq "...until its notice" "x" "$(fire "$Q" "$(withtr)" | reason_of)"
+# Clock entries are unaffected: a due timed entry fires mid-wait, and passes a held after.
+: > "$TR"; bgbash d1
+printf 'after\t%s\theld\n%s\t%s\ton the clock\n' "$BGSID" "$PAST" "$BGSID" > "$Q"
+assert_eq "a due timed entry still fires while work runs" "on the clock" "$(fire "$Q" "$(withtr)" | reason_of)"
+assert_eq "...and the held after is left" "held" "$(cut -f3 "$Q")"
+# A chained after behind a held one waits too.
+printf 'after\t%s\tfirst\nafter\t%s\tsecond\n' "$BGSID" "$BGSID" > "$Q"
+assert_eq "the chain behind a held after waits" "" "$(fire "$Q" "$(withtr)" | reason_of)"
+delivered d1
+assert_eq "chain resumes in order" "first" "$(fire "$Q" "$(withtr)" | reason_of)"
+# Stale tasks don't hold forever: older than CIRCLE_BACK_BG_MAX_WAIT, or than this process.
+: > "$TR"; bgbash old1 "ancient" true $(( $(NOW) - 20000 ))
+printf 'after\t%s\tx\n' "$BGSID" > "$Q"
+assert_eq "a task past the max wait is ignored" "x" "$(fire "$Q" "$(withtr)" | reason_of)"
+: > "$TR"; bgbash r1 "recent"
+printf 'after\t%s\tx\n' "$BGSID" > "$Q"
+assert_eq "CIRCLE_BACK_BG_MAX_WAIT=0 turns the wait off" "x" \
+  "$(CIRCLE_BACK_BG_MAX_WAIT=0 fire "$Q" "$(withtr)" | reason_of)"
+rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
+jq -nc --argjson p $$ --arg s "$BGSID" --argjson st $(( ($(NOW) + 5) * 1000 )) '{pid:$p,sessionId:$s,startedAt:$st}' > "$CIRCLE_BACK_SESSIONS_DIR/$$-$BGSID.json"
+printf 'after\t%s\tx\n' "$BGSID" > "$Q"
+assert_eq "a task from before this process started (resume) is ignored" "x" "$(fire "$Q" "$(withtr)" | reason_of)"
+rm -f "$CIRCLE_BACK_SESSIONS_DIR"/*.json
+# No transcript (an older Claude Code, or a missing file): behaves as before.
+printf 'after\t%s\tx\n' "$BGSID" > "$Q"
+assert_eq "missing transcript: fires as before" "x" \
+  "$(fire "$Q" "$(jq -nc --arg s "$BGSID" '{cwd:"/tmp",session_id:$s,transcript_path:"/nonexistent.jsonl"}')" | reason_of)"
+
 head_ "7. malformed due time fires immediately"
 Q="$WORK/junk.queue"; printf 'abc\tbad due time\n' > "$Q"
 assert_eq "still fires" "bad due time" "$(fire "$Q" | reason_of)"
