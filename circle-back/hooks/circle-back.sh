@@ -171,9 +171,10 @@ eligible() {
 # tool result carrying its id (Bash `backgroundTaskId`, including a command
 # moved to the background at its timeout; Monitor `taskId`; an async Agent's
 # `agentId`) and ends with a <task-notification> carrying that id and a final
-# status, once delivered to the agent. A persistent Monitor never ends, so it
-# is no task to wait on. Loaded lazily: only an `after` entry about to come
-# due needs it. Pass 1 finds unfinished task ids; pass 2 looks up their
+# status, once delivered to the agent -- or with a TaskStop result naming it
+# (`task_id`): a stopped task gets no notification. A persistent Monitor never
+# ends, so it is no task to wait on. Loaded lazily: only an `after` entry
+# about to come due needs it. Pass 1 finds unfinished task ids; pass 2 looks up their
 # tool calls to drop circle-back's own wake-ups and to name the rest.
 BG_LOADED=0; BG_N=0; BG_RUNNING=""
 # Lines of file $1 containing any of the fixed strings $2..., in file order.
@@ -193,7 +194,7 @@ load_background() {
   load_registry
   local since=$(( NOW - BG_MAX_WAIT )) open tid tuid call desc
   [ "$MY_START" -le "$since" ] || since=$MY_START
-  open=$(lines_with "$TRANSCRIPT" backgroundTaskId '"taskId"' async_launched '<task-notification>' |
+  open=$(lines_with "$TRANSCRIPT" backgroundTaskId '"taskId"' '"task_id"' async_launched '<task-notification>' |
     jq -rn --argjson since "$since" '
       def ts: (.timestamp // "" | sub("\\.[0-9]+Z$"; "Z") | try fromdate catch 0);
       def texts: (.message.content? | if type == "string" then . elif type == "array"
@@ -207,6 +208,8 @@ load_background() {
               then .s[$id] = ([$e.message.content | arrays | .[] | objects | .tool_use_id // empty][0] // "")
               else . end
           else . end )
+        | ($e.toolUseResult.task_id? // null) as $stopped
+        | (if ($stopped | type) == "string" then .d[$stopped] = true else . end)
         | reduce ($e | texts | scan("<task-notification>[\\s\\S]*?</task-notification>")
                   | select(test("<status>(completed|failed|killed|stopped)</status>"))
                   | capture("<task-id>(?<id>[^<]+)</task-id>").id) as $id (.; .d[$id] = true))

@@ -23,7 +23,7 @@ $SRC/test/offline-tests.sh
 
 ## Definition of done
 
-- `bash test/offline-tests.sh` reports 0 failures (165 assertions)
+- `bash test/offline-tests.sh` reports 0 failures (167 assertions)
 - `/hooks` lists `circle-back.sh` under Stop
 - A single queued prompt fires after its delay, unprompted
 - Two queued prompts fire in order across consecutive turns
@@ -79,7 +79,7 @@ cd "$SRC" && bash test/offline-tests.sh
 ```
 
 **Pass condition:** final line reads `N passed, 0 failed`, exit status 0.
-Expect 165 assertions across 23 groups.
+Expect 167 assertions across 23 groups.
 
 Any failure → stop and report the failing group verbatim. Do not install over a
 red harness.

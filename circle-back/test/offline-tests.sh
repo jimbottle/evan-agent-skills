@@ -308,6 +308,12 @@ done
 jq -nc --arg c "$(note a1)" '{type:"attachment",attachment:{type:"queued_command",prompt:$c}}' >> "$TR"
 printf 'after\t%s\tx\n' "$BGSID" > "$Q"
 assert_eq "a notice delivered as an attachment ends the task" "x" "$(fire "$Q" "$(withtr)" | reason_of)"
+# TaskStop writes no notification, only a tool result naming the task.
+: > "$TR"; bgbash ts1 "npm run dev"
+printf 'after\t%s\tx\n' "$BGSID" > "$Q"
+assert_eq "a running dev server holds" "" "$(fire "$Q" "$(withtr)" | reason_of)"
+started tu_stop '{"message":"Successfully stopped task: ts1 (npm run dev)","task_id":"ts1","task_type":"local_bash"}'
+assert_eq "TaskStop ends the task" "x" "$(fire "$Q" "$(withtr)" | reason_of)"
 # Two tasks: the entry waits for both, one notice per turn.
 : > "$TR"; bgbash t1 "build"; bgbash t2 "tests"
 printf 'after\t%s\tafter both\n' "$BGSID" > "$Q"

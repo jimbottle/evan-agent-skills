@@ -153,7 +153,8 @@ A turn ending is not always the task ending. While you wait on a background
 command, a `Monitor` or an async subagent, you end turns to wait, and each
 completion notice starts another. So an `after` entry (plain or with a delay)
 is also held while the session's transcript shows a background task started
-with no final notice (completed, failed, killed or stopped) delivered yet.
+with no final notice (completed, failed, killed or stopped) delivered yet
+and no `TaskStop` of it.
 It comes due at the Stop that ends the turn that handled the last notice,
 and an `after <seconds>` timer starts only then. While it is held, the hook
 says so at each Stop ("circle-back: holding '...' until 2 background task(s)
