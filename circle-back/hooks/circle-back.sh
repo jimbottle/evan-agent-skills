@@ -60,6 +60,14 @@
 # don't count, nor do tasks older than BG_MAX_WAIT or older than the running
 # process (a resumed session's tasks died with the old one).
 #
+# Not every background task is one the work waits on: an emulator or dev
+# server started in the background never exits, and held `/roborev-fix` for
+# hours (2026-10-13, watch-ads-not-working). The hook can't tell the two
+# apart; the agent can. So the first Stop that holds an entry for a task
+# blocks once, asking the agent to exempt any task the work isn't waiting on
+# (its id goes in <queue>.bg-ignore). Ids already asked about are kept in
+# <queue>.bg-asked, so each task is asked about once and the hold never loops.
+#
 # Entries belong to the session that queued them. The queue file is keyed by
 # directory, and OTHER Claude Code sessions run in the same directory -- a
 # roborev reviewer (`claude -p`) finishing its review is a Stop too, and it
@@ -176,7 +184,7 @@ eligible() {
 # ends, so it is no task to wait on. Loaded lazily: only an `after` entry
 # about to come due needs it. Pass 1 finds unfinished task ids; pass 2 looks up their
 # tool calls to drop circle-back's own wake-ups and to name the rest.
-BG_LOADED=0; BG_N=0; BG_RUNNING=""
+BG_LOADED=0; BG_N=0; BG_RUNNING=""; BG_IDS=""
 # Lines of file $1 containing any of the fixed strings $2..., in file order.
 # perl when present: BSD grep takes ~0.7s on a 26 MB transcript, perl ~0.05s.
 lines_with() {
@@ -225,6 +233,7 @@ load_background() {
            | [$id, (if (tostring | test("circle-back wake-up|circle-back: entry due")) then 1 else 0 end),
               (.description // "" | gsub("[\t\n]"; " "))] | @tsv' 2>/dev/null)
   while IFS=$'\t' read -r tid tuid; do
+    [ -f "$QUEUE.bg-ignore" ] && grep -qxF "$tid" "$QUEUE.bg-ignore" && continue
     desc=$tid
     if [ -n "$tuid" ]; then
       call=$(awk -F '\t' -v u="$tuid" '$1 == u { print; exit }' <<<"$calls")
@@ -232,7 +241,7 @@ load_background() {
       call=${call#*$'\t'}; call=${call#*$'\t'}
       [ -z "$call" ] || desc=$call
     fi
-    BG_N=$((BG_N+1)); BG_RUNNING="$BG_RUNNING$desc"$'\n'
+    BG_N=$((BG_N+1)); BG_RUNNING="$BG_RUNNING$desc"$'\n'; BG_IDS="$BG_IDS$tid"$'\t'"$desc"$'\n'
   done <<<"$open"
 }
 
@@ -361,13 +370,27 @@ fi
 
 # Nothing due yet: end the turn normally. This is the common case and is what
 # keeps the session interactive while long entries are pending. If an `after`
-# entry is being held for background work, say what it is waiting on.
+# entry is being held for background work, say what it is waiting on -- and
+# the first time a task holds it, ask the agent whether the work waits on it.
 if [ "$TARGET" -eq 0 ]; then
   if [ "$HELD" -gt 0 ]; then
     ENTRY=$(sed -n "${HELD}p" "$QUEUE")
     PROMPT=${ENTRY#*$'\t'}
     [ -z "$(entry_sid "$ENTRY")" ] || PROMPT=${PROMPT#*$'\t'}
     FEW=$(printf '%s' "$PROMPT" | awk '{n=(NF>6?6:NF); s=$1; for(i=2;i<=n;i++) s=s" "$i; if(NF>6) s=s"..."; print s}')
+    NEW=""
+    while IFS=$'\t' read -r tid desc; do
+      [ -n "$tid" ] || continue
+      [ -f "$QUEUE.bg-asked" ] && grep -qxF "$tid" "$QUEUE.bg-asked" && continue
+      NEW="$NEW$tid ($desc); "
+      printf '%s\n' "$tid" >> "$QUEUE.bg-asked"
+    done <<<"$BG_IDS"
+    if [ -n "$NEW" ]; then
+      ASK="circle-back: the queued \"$FEW\" waits for the current work to end, and these background tasks are still running: ${NEW%; }. Do nothing else this turn. For each one, judge whether the current work is waiting for it to finish. A CI watch, build or test run: leave it, and the entry fires once it finishes. A long-running process the work does not wait on (a dev server, an emulator, a file watcher): exempt it with the Bash tool, one id per line: printf '%s\\n' <id> >> '$QUEUE.bg-ignore'. Then end the turn with one short line saying what the entry now waits on, if anything."
+      jq -n --arg p "$ASK" --arg n "$BG_N" \
+        '{decision:"block", reason:$p, systemMessage:("circle-back: asking whether the work waits on " + $n + " background task(s)")}'
+      exit 0
+    fi
     jq -n --arg p "$FEW" --arg n "$BG_N" --arg l "$(printf '%s' "$BG_RUNNING" | awk 'NF { printf "%s%s", (n++ ? "; " : ""), $0 }')" \
       '{systemMessage:("circle-back: holding \"" + $p + "\" until " + $n + " background task(s) finish: " + $l)}'
   fi

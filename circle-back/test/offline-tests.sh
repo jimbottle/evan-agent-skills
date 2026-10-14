@@ -286,12 +286,21 @@ started() { # tool_use_id toolUseResult-json [at_epoch]
 }
 note() { printf '<task-notification>\n<task-id>%s</task-id>\n<status>%s</status>\n</task-notification>' "$1" "${2:-completed}"; }
 delivered() { jq -nc --arg c "$(note "$1" "${2:-completed}")" '{type:"user",message:{role:"user",content:$c}}' >> "$TR"; }
+# A held Stop either asks the agent about new tasks (once each) or stays quiet.
+held() { local r; r=$(reason_of); [ -z "$r" ] || [ "${r#circle-back: the queued}" != "$r" ]; }
 bgbash() { call "tu_$1" Bash "${2:-Wait for CI}" "${3:-true}" "${4:-}"; started "tu_$1" "{\"backgroundTaskId\":\"$1\"}" "${4:-}"; }
 register "$BGSID" $$
 : > "$TR"; bgbash b1 "Wait for the CI run"
 printf 'after:%s\t%s\tright after\n' "$(NOW)" "$BGSID" > "$Q"
+rm -f "$Q.bg-asked" "$Q.bg-ignore"
 OUT=$(fire "$Q" "$(withtr)")
-assert_eq "held while a background command runs" "" "$(reason_of <<<"$OUT")"
+case "$(reason_of <<<"$OUT")" in
+  'circle-back: the queued "right after" waits for'*'b1 (Wait for the CI run)'*"$Q.bg-ignore"*) ok "first hold asks the agent, naming the task and the exempt file" ;;
+  *) bad "first hold asks the agent, naming the task and the exempt file" "$OUT" ;;
+esac
+assert_eq "...and records that it asked" "b1" "$(cat "$Q.bg-asked")"
+OUT=$(fire "$Q" "$(withtr)")
+assert_eq "asked once: the next Stop just holds" "" "$(reason_of <<<"$OUT")"
 assert_eq "...and says what it waits on" 'circle-back: holding "right after" until 1 background task(s) finish: Wait for the CI run' "$(sysmsg <<<"$OUT")"
 assert_eq "...entry retained" "1" "$(grep -c . "$Q")"
 jq -nc --arg c "$(note b1)" '{type:"queue-operation",operation:"enqueue",content:$c}' >> "$TR"
@@ -311,12 +320,13 @@ assert_eq "a notice delivered as an attachment ends the task" "x" "$(fire "$Q" "
 # TaskStop writes no notification, only a tool result naming the task.
 : > "$TR"; bgbash ts1 "npm run dev"
 printf 'after\t%s\tx\n' "$BGSID" > "$Q"
-assert_eq "a running dev server holds" "" "$(fire "$Q" "$(withtr)" | reason_of)"
+fire "$Q" "$(withtr)" | held && ok "a running dev server holds" || bad "a running dev server holds"
 started tu_stop '{"message":"Successfully stopped task: ts1 (npm run dev)","task_id":"ts1","task_type":"local_bash"}'
 assert_eq "TaskStop ends the task" "x" "$(fire "$Q" "$(withtr)" | reason_of)"
 # Two tasks: the entry waits for both, one notice per turn.
 : > "$TR"; bgbash t1 "build"; bgbash t2 "tests"
 printf 'after\t%s\tafter both\n' "$BGSID" > "$Q"
+fire "$Q" "$(withtr)" | held && ok "two running: held" || bad "two running: held"
 assert_eq "two running: lists both" 'circle-back: holding "after both" until 2 background task(s) finish: build; tests' "$(fire "$Q" "$(withtr)" | sysmsg)"
 delivered t1
 assert_eq "one left: still held" "" "$(fire "$Q" "$(withtr)" | reason_of)"
@@ -325,7 +335,7 @@ assert_eq "both done: fires" "after both" "$(fire "$Q" "$(withtr)" | reason_of)"
 # after+N: the timer does not start while background work runs.
 : > "$TR"; bgbash c1
 printf 'after+120:%s\t%s\t/roborev-fix\n' "$(NOW)" "$BGSID" > "$Q"
-assert_eq "after+N: no wake-up while held" "" "$(fire "$Q" "$(withtr)" | reason_of)"
+fire "$Q" "$(withtr)" | held && ok "after+N: no wake-up while held" || bad "after+N: no wake-up while held"
 assert_eq "after+N: not converted while held" "after+120" "$(cut -f1 "$Q" | sed 's/:.*//')"
 delivered c1
 fire "$Q" "$(withtr)" | reason_of | grep -q '^circle-back wake-up' && ok "after+N: timer starts once the task is done" \
@@ -339,11 +349,13 @@ assert_eq "a circle-back wake-up does not hold" "not held by wake-ups" "$(fire "
 # Monitor (non-persistent) and async Agent tasks count; a persistent Monitor never ends, so it doesn't.
 : > "$TR"; call tu_m1 Monitor "watch deploy"; started tu_m1 '{"taskId":"m1","timeoutMs":300000,"persistent":false}'
 printf 'after\t%s\tx\n' "$BGSID" > "$Q"
+fire "$Q" "$(withtr)" >/dev/null
 assert_eq "a Monitor holds" 'circle-back: holding "x" until 1 background task(s) finish: watch deploy' "$(fire "$Q" "$(withtr)" | sysmsg)"
 : > "$TR"; call tu_m2 Monitor "tail logs"; started tu_m2 '{"taskId":"m2","persistent":true}'
 assert_eq "a persistent Monitor does not hold" "x" "$(fire "$Q" "$(withtr)" | reason_of)"
 : > "$TR"; call tu_g1 Agent "review the diff"; started tu_g1 '{"agentId":"ag1","status":"async_launched","isAsync":true}'
 printf 'after\t%s\tx\n' "$BGSID" > "$Q"
+fire "$Q" "$(withtr)" >/dev/null
 assert_eq "an async Agent holds" 'circle-back: holding "x" until 1 background task(s) finish: review the diff' "$(fire "$Q" "$(withtr)" | sysmsg)"
 delivered ag1
 assert_eq "...until its notice" "x" "$(fire "$Q" "$(withtr)" | reason_of)"
@@ -354,9 +366,29 @@ assert_eq "a due timed entry still fires while work runs" "on the clock" "$(fire
 assert_eq "...and the held after is left" "held" "$(cut -f3 "$Q")"
 # A chained after behind a held one waits too.
 printf 'after\t%s\tfirst\nafter\t%s\tsecond\n' "$BGSID" "$BGSID" > "$Q"
-assert_eq "the chain behind a held after waits" "" "$(fire "$Q" "$(withtr)" | reason_of)"
+fire "$Q" "$(withtr)" | held && ok "the chain behind a held after waits" || bad "the chain behind a held after waits"
 delivered d1
 assert_eq "chain resumes in order" "first" "$(fire "$Q" "$(withtr)" | reason_of)"
+# 2026-10-13: an emulator started in the background never exits and held
+# '/roborev-fix' for hours. The agent exempts it when asked; nothing else changes.
+: > "$TR"; rm -f "$Q.bg-asked" "$Q.bg-ignore"; bgbash emu1 "Boot Pixel 7 emulator"; bgbash ci1 "Wait for CI"
+printf 'after+180:%s\t%s\t/roborev-fix\n' "$(NOW)" "$BGSID" > "$Q"
+fire "$Q" "$(withtr)" | reason_of | grep -q 'emu1 (Boot Pixel 7 emulator); ci1 (Wait for CI)' \
+  && ok "asks about both tasks in one turn" || bad "asks about both tasks in one turn"
+printf 'emu1\n' >> "$Q.bg-ignore"                          # the agent's answer
+assert_eq "exempted emulator no longer listed" 'circle-back: holding "/roborev-fix" until 1 background task(s) finish: Wait for CI' \
+  "$(fire "$Q" "$(withtr)" | sysmsg)"
+delivered ci1
+fire "$Q" "$(withtr)" | reason_of | grep -q '^circle-back wake-up' && ok "timer starts with only the emulator running" \
+  || bad "timer starts with only the emulator running"
+# A task started later is new: asked about once more.
+: > "$TR"; bgbash emu1 "Boot Pixel 7 emulator"; bgbash srv2 "npm run dev"
+printf 'after\t%s\tx\n' "$BGSID" > "$Q"
+R=$(fire "$Q" "$(withtr)" | reason_of)
+case "$R" in *srv2*) case "$R" in *emu1*) bad "asks only about the new task" "$R" ;; *) ok "asks only about the new task" ;; esac ;;
+  *) bad "asks only about the new task" "$R" ;; esac
+rm -f "$Q.bg-asked" "$Q.bg-ignore"
+
 # Stale tasks don't hold forever: older than CIRCLE_BACK_BG_MAX_WAIT, or than this process.
 : > "$TR"; bgbash old1 "ancient" true $(( $(NOW) - 20000 ))
 printf 'after\t%s\tx\n' "$BGSID" > "$Q"

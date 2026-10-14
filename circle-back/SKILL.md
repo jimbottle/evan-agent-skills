@@ -163,10 +163,20 @@ finish: ..."). Not counted: circle-back's own wake-ups, a persistent `Monitor`
 (default 14400, 4 hours; `0` turns this wait off) or older than the running
 Claude Code process. Timed entries are not held: a clock is a clock.
 
-So a background task that is not something the work waits on, such as a dev
-server left running, holds every `after` entry until it is stopped. If the
-hook reports holding for a task like that, tell the user and offer to stop it
-(`TaskStop`) rather than leaving the entry stuck.
+Not every background task is one the work waits on: a dev server, emulator
+or file watcher started in the background never exits. The hook can't tell
+the difference, so the first Stop that holds an entry for a task blocks once
+and asks you (it shows up as "Stop hook feedback" starting "circle-back: the
+queued ..."). Answer it and nothing else: leave a CI watch, build or test run
+alone; for a long-running process the work isn't waiting on, append its task
+id to the `.bg-ignore` file the question names, one id per line. Then end the
+turn with one short line saying what the entry now waits on. Each task is
+asked about once (ids asked about go in `<queue>.bg-asked`), so the question
+never loops; a task started later is asked about when it first holds the
+entry. Stopping the task (`TaskStop`) also releases it.
+
+When you confirm an `after` entry while such a process is running, exempt it
+up front the same way instead of waiting for the question.
 
 ### `after <seconds>`: a timer that starts when the task ahead finishes
 
